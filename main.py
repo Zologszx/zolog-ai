@@ -670,13 +670,19 @@ async def text_request(message: Message):
                 answer[i:i + max_length]
             )
 
-    except Exception as error:
+        except Exception as error:
 
-        print("GEMINI ERROR:", repr(error))
+        print("================================")
+        print("GEMINI ERROR")
+        print("================================")
+        print(type(error).__name__)
+        print(str(error))
+        print(repr(error))
+        print("================================")
 
         await message.answer(
-            "❌ Не удалось получить ответ от AI.\n\n"
-            "Проверь Gemini API key и настройки модели."
+            "❌ Ошибка Gemini.\n\n"
+            "Я записал подробности ошибки в логи Render."
         )
 
 
