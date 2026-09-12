@@ -1,322 +1,291 @@
-import asyncio
 import os
+import asyncio
+import logging
 import sqlite3
-from datetime import datetime
-from pathlib import Path
 
 from aiohttp import web
-from aiogram import Bot, Dispatcher, F, Router
-from aiogram.filters import Command, CommandStart
-from aiogram.types import Message, FSInputFile
-
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import Command
 from google import genai
-from google.genai import types
-
-from pypdf import PdfReader
-from docx import Document
 
 
-# =========================================================
-# CONFIG
-# =========================================================
+# =========================
+# НАСТРОЙКИ
+# =========================
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+ADMIN_ID = os.getenv("ADMIN_ID")
 
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-
-MAX_FILE_SIZE = 20 * 1024 * 1024
-
-BASE_DIR = Path(__file__).parent
-DATA_DIR = BASE_DIR / "data"
-UPLOAD_DIR = BASE_DIR / "uploads"
-OUTPUT_DIR = BASE_DIR / "outputs"
-
-DATA_DIR.mkdir(exist_ok=True)
-UPLOAD_DIR.mkdir(exist_ok=True)
-OUTPUT_DIR.mkdir(exist_ok=True)
-
-DB_PATH = DATA_DIR / "zolog.db"
-
-
-# =========================================================
-# CHECK CONFIG
-# =========================================================
+GEMINI_MODEL = os.getenv(
+    "GEMINI_MODEL",
+    "gemini-2.5-flash"
+)
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is not configured")
+    raise RuntimeError("BOT_TOKEN не найден")
 
 if not GEMINI_API_KEY:
-    raise RuntimeError("GEMINI_API_KEY is not configured")
+    raise RuntimeError("GEMINI_API_KEY не найден")
 
 
-# =========================================================
-# CLIENTS
-# =========================================================
+# =========================
+# ЛОГИ
+# =========================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+
+logger = logging.getLogger("zolog-ai")
+
+
+# =========================
+# TELEGRAM + GEMINI
+# =========================
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
-router = Router()
 
-gemini = genai.Client(api_key=GEMINI_API_KEY)
+gemini = genai.Client(
+    api_key=GEMINI_API_KEY
+)
 
 
-# =========================================================
-# DATABASE
-# =========================================================
+# =========================
+# БАЗА ДАННЫХ
+# =========================
 
-def db():
-    return sqlite3.connect(DB_PATH)
+DB_NAME = "zolog_ai.db"
 
 
 def init_db():
-    connection = db()
-    cursor = connection.cursor()
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            telegram_id INTEGER UNIQUE NOT NULL,
             username TEXT,
             first_name TEXT,
-            created_at TEXT,
-            requests INTEGER DEFAULT 0
-        )
-    """)
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS files (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            filename TEXT,
-            path TEXT,
-            created_at TEXT
+            requests_count INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS materials (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            type TEXT,
-            prompt TEXT,
+            telegram_id INTEGER NOT NULL,
+            material_type TEXT,
+            title TEXT,
             content TEXT,
-            created_at TEXT
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
 
-    connection.commit()
-    connection.close()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS payments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            telegram_id INTEGER NOT NULL,
+            stars INTEGER DEFAULT 0,
+            status TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    conn.commit()
+    conn.close()
 
 
-def save_user(message: Message):
-    user = message.from_user
-
-    connection = db()
-    cursor = connection.cursor()
+def add_user(user: types.User):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
 
     cursor.execute("""
-        INSERT INTO users (
-            id,
-            username,
-            first_name,
-            created_at
-        )
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET
-            username=excluded.username,
-            first_name=excluded.first_name
+        INSERT OR IGNORE INTO users
+        (telegram_id, username, first_name)
+        VALUES (?, ?, ?)
     """, (
         user.id,
         user.username,
-        user.first_name,
-        datetime.now().isoformat()
-    ))
-
-    connection.commit()
-    connection.close()
-
-
-def save_material(user_id, material_type, prompt, content):
-    connection = db()
-    cursor = connection.cursor()
-
-    cursor.execute("""
-        INSERT INTO materials (
-            user_id,
-            type,
-            prompt,
-            content,
-            created_at
-        )
-        VALUES (?, ?, ?, ?, ?)
-    """, (
-        user_id,
-        material_type,
-        prompt,
-        content,
-        datetime.now().isoformat()
+        user.first_name
     ))
 
     cursor.execute("""
         UPDATE users
-        SET requests = requests + 1
-        WHERE id = ?
-    """, (user_id,))
+        SET username = ?, first_name = ?
+        WHERE telegram_id = ?
+    """, (
+        user.username,
+        user.first_name,
+        user.id
+    ))
 
-    connection.commit()
-    connection.close()
-
-
-# =========================================================
-# ADMIN
-# =========================================================
-
-def is_admin(user_id: int) -> bool:
-    return user_id == ADMIN_ID
+    conn.commit()
+    conn.close()
 
 
-# =========================================================
+def save_material(
+    telegram_id: int,
+    material_type: str,
+    title: str,
+    content: str
+):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        INSERT INTO materials
+        (telegram_id, material_type, title, content)
+        VALUES (?, ?, ?, ?)
+    """, (
+        telegram_id,
+        material_type,
+        title,
+        content
+    ))
+
+    cursor.execute("""
+        UPDATE users
+        SET requests_count = requests_count + 1
+        WHERE telegram_id = ?
+    """, (telegram_id,))
+
+    conn.commit()
+    conn.close()
+
+
+# =========================
 # GEMINI
-# =========================================================
+# =========================
 
-async def ask_gemini(prompt: str) -> str:
-
-    response = await asyncio.to_thread(
-        gemini.models.generate_content,
-        model=GEMINI_MODEL,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            temperature=0.7,
-            max_output_tokens=8192
+async def ask_ai(prompt: str) -> str:
+    try:
+        response = await asyncio.to_thread(
+            gemini.models.generate_content,
+            model=GEMINI_MODEL,
+            contents=prompt
         )
-    )
 
-    if not response.text:
-        raise RuntimeError("Gemini returned an empty response")
+        if not response or not response.text:
+            return "❌ Gemini не вернул текстовый ответ."
 
-    return response.text
+        return response.text
 
+    except Exception as error:
+        logger.exception("Ошибка Gemini: %s", error)
 
-# =========================================================
-# FILE TEXT EXTRACTION
-# =========================================================
-
-def extract_pdf(path: str) -> str:
-
-    reader = PdfReader(path)
-
-    text = []
-
-    for page in reader.pages:
-        try:
-            page_text = page.extract_text() or ""
-            text.append(page_text)
-        except Exception:
-            pass
-
-    return "\n".join(text)
+        return (
+            "❌ Произошла ошибка при обращении к AI.\n\n"
+            f"Тип ошибки: {type(error).__name__}\n"
+            f"Описание: {error}"
+        )
 
 
-def extract_docx(path: str) -> str:
+# =========================
+# /START
+# =========================
 
-    document = Document(path)
-
-    paragraphs = []
-
-    for paragraph in document.paragraphs:
-        if paragraph.text.strip():
-            paragraphs.append(paragraph.text)
-
-    return "\n".join(paragraphs)
-
-
-def extract_text_file(path: str) -> str:
-
-    return Path(path).read_text(
-        encoding="utf-8",
-        errors="ignore"
-    )
-
-
-def extract_text(path: str) -> str:
-
-    extension = Path(path).suffix.lower()
-
-    if extension == ".pdf":
-        return extract_pdf(path)
-
-    if extension == ".docx":
-        return extract_docx(path)
-
-    if extension in [".txt", ".md"]:
-        return extract_text_file(path)
-
-    return ""
-
-
-# =========================================================
-# START
-# =========================================================
-
-@router.message(CommandStart())
-async def start(message: Message):
-
-    save_user(message)
-
-    admin_text = ""
-
-    if is_admin(message.from_user.id):
-        admin_text = "\n\n👑 Ты вошёл как администратор.\n/admin — админ-панель"
+@dp.message(Command("start"))
+async def start_handler(message: types.Message):
+    add_user(message.from_user)
 
     await message.answer(
         "🤖 <b>Zolog AI</b>\n\n"
-        "Привет! Я AI-помощник для учебы.\n\n"
-        "Что я умею:\n"
-        "📝 Рефераты\n"
-        "📚 Курсовые\n"
-        "📋 Конспекты\n"
-        "❓ Ответы на вопросы\n"
-        "📖 Работа с загруженными книгами и файлами\n"
-        "🧠 Обычный AI-помощник\n\n"
-        "Просто напиши мне свой запрос."
-        + admin_text,
+        "Привет! Я твой AI-помощник.\n\n"
+        "Я умею:\n"
+        "📚 работать с учебными материалами\n"
+        "📝 создавать тексты\n"
+        "🎓 помогать с рефератами и курсовыми\n"
+        "🧠 отвечать на вопросы\n"
+        "📊 анализировать информацию\n\n"
+        "Просто напиши мне свой запрос.",
         parse_mode="HTML"
     )
 
 
-# =========================================================
-# HELP
-# =========================================================
+# =========================
+# /HELP
+# =========================
 
-@router.message(Command("help"))
-async def help_command(message: Message):
-
+@dp.message(Command("help"))
+async def help_handler(message: types.Message):
     await message.answer(
-        "🆘 <b>Zolog AI — помощь</b>\n\n"
-        "Напиши обычный запрос, например:\n\n"
-        "• Объясни туннельный синдром простыми словами\n"
-        "• Напиши реферат на тему ХОЗЛ\n"
-        "• Сделай план курсовой по физической терапии\n"
-        "• Составь конспект по теме\n\n"
-        "Также можно отправить PDF, DOCX или TXT файл.",
-        parse_mode="HTML"
+        "📖 <b>Помощь Zolog AI</b>\n\n"
+        "Примеры запросов:\n\n"
+        "• Объясни, что такое ХОЗЛ\n"
+        "• Создай план реферата по физической терапии\n"
+        "• Составь конспект по теме\n"
+        "• Объясни тему простыми словами\n\n"
+        "В будущем здесь появятся:\n"
+        "📚 библиотека файлов\n"
+        "📄 DOCX/PDF\n"
+        "📊 презентации\n"
+        "🎥 анализ видео\n"
+        "💳 Telegram Stars\n"
+        "👑 полноценная админ-панель"
     )
 
 
-# =========================================================
-# ADMIN PANEL
-# =========================================================
+# =========================
+# /ADMIN
+# =========================
 
-@router.message(Command("admin"))
-async def admin_command(message: Message):
+def is_admin(user_id: int) -> bool:
+    if not ADMIN_ID:
+        return False
 
+    return str(user_id) == str(ADMIN_ID)
+
+
+@dp.message(Command("admin"))
+async def admin_handler(message: types.Message):
     if not is_admin(message.from_user.id):
-        await message.answer("⛔ У тебя нет доступа к админ-панели.")
+        await message.answer("⛔ У вас нет доступа.")
         return
 
-    connection = db()
-    cursor = connection.cursor()
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT COUNT(*) FROM users")
+    users_count = cursor.fetchone()[0]
+
+    cursor.execute("SELECT COUNT(*) FROM materials")
+    materials_count = cursor.fetchone()[0]
+
+    cursor.execute("SELECT COUNT(*) FROM payments")
+    payments_count = cursor.fetchone()[0]
+
+    conn.close()
+
+    await message.answer(
+        "👑 <b>Zolog AI — Admin Panel</b>\n\n"
+        f"👥 Пользователей: <b>{users_count}</b>\n"
+        f"📚 Материалов: <b>{materials_count}</b>\n"
+        f"💳 Платежей: <b>{payments_count}</b>\n\n"
+        "Команды:\n"
+        "/stats — статистика\n"
+        "/users — пользователи\n"
+        "/materials — материалы",
+        parse_mode="HTML"
+    )
+
+
+# =========================
+# /STATS
+# =========================
+
+@dp.message(Command("stats"))
+async def stats_handler(message: types.Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ У вас нет доступа.")
+        return
+
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
 
     cursor.execute("SELECT COUNT(*) FROM users")
     users = cursor.fetchone()[0]
@@ -324,371 +293,141 @@ async def admin_command(message: Message):
     cursor.execute("SELECT COUNT(*) FROM materials")
     materials = cursor.fetchone()[0]
 
-    cursor.execute("SELECT COUNT(*) FROM files")
-    files = cursor.fetchone()[0]
+    cursor.execute(
+        "SELECT COALESCE(SUM(requests_count), 0) FROM users"
+    )
+    requests = cursor.fetchone()[0]
 
-    connection.close()
+    conn.close()
 
     await message.answer(
-        "👑 <b>ZOLOG AI — ADMIN PANEL</b>\n\n"
-        f"👥 Пользователи: <b>{users}</b>\n"
-        f"📝 Материалы: <b>{materials}</b>\n"
-        f"📚 Файлы: <b>{files}</b>\n\n"
-        "Команды:\n"
-        "/users — пользователи\n"
-        "/materials — материалы\n"
-        "/files — загруженные файлы",
+        "📊 <b>Статистика Zolog AI</b>\n\n"
+        f"👥 Пользователей: {users}\n"
+        f"📝 AI-запросов: {requests}\n"
+        f"📚 Материалов: {materials}",
         parse_mode="HTML"
     )
 
 
-# =========================================================
-# ADMIN USERS
-# =========================================================
+# =========================
+# /USERS
+# =========================
 
-@router.message(Command("users"))
-async def admin_users(message: Message):
-
+@dp.message(Command("users"))
+async def users_handler(message: types.Message):
     if not is_admin(message.from_user.id):
+        await message.answer("⛔ У вас нет доступа.")
         return
 
-    connection = db()
-    cursor = connection.cursor()
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
 
     cursor.execute("""
-        SELECT id, username, first_name, requests
+        SELECT telegram_id, username, first_name, requests_count
         FROM users
-        ORDER BY created_at DESC
+        ORDER BY id DESC
         LIMIT 20
     """)
 
-    rows = cursor.fetchall()
+    users = cursor.fetchall()
+    conn.close()
 
-    connection.close()
-
-    if not rows:
-        await message.answer("Пользователей пока нет.")
+    if not users:
+        await message.answer("👥 Пользователей пока нет.")
         return
 
     text = "👥 <b>Последние пользователи</b>\n\n"
 
-    for row in rows:
-        user_id, username, first_name, requests = row
+    for telegram_id, username, first_name, requests in users:
+        name = first_name or "Без имени"
+        username_text = f"@{username}" if username else "без username"
 
         text += (
-            f"👤 {first_name or 'Без имени'}\n"
-            f"ID: <code>{user_id}</code>\n"
-            f"Username: @{username or 'нет'}\n"
-            f"Запросов: {requests}\n\n"
+            f"👤 {name}\n"
+            f"   {username_text}\n"
+            f"   ID: <code>{telegram_id}</code>\n"
+            f"   Запросов: {requests}\n\n"
         )
 
-    await message.answer(text, parse_mode="HTML")
+    await message.answer(
+        text,
+        parse_mode="HTML"
+    )
 
 
-# =========================================================
-# ADMIN MATERIALS
-# =========================================================
+# =========================
+# /MATERIALS
+# =========================
 
-@router.message(Command("materials"))
-async def admin_materials(message: Message):
-
+@dp.message(Command("materials"))
+async def materials_handler(message: types.Message):
     if not is_admin(message.from_user.id):
+        await message.answer("⛔ У вас нет доступа.")
         return
 
-    connection = db()
-    cursor = connection.cursor()
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
 
     cursor.execute("""
-        SELECT id, user_id, type, created_at
+        SELECT id, telegram_id, material_type, title
         FROM materials
         ORDER BY id DESC
         LIMIT 20
     """)
 
-    rows = cursor.fetchall()
+    materials = cursor.fetchall()
+    conn.close()
 
-    connection.close()
-
-    if not rows:
-        await message.answer("Материалов пока нет.")
+    if not materials:
+        await message.answer("📚 Материалов пока нет.")
         return
 
-    text = "📝 <b>Последние материалы</b>\n\n"
+    text = "📚 <b>Последние материалы</b>\n\n"
 
-    for material_id, user_id, material_type, created_at in rows:
-
+    for material_id, telegram_id, material_type, title in materials:
         text += (
             f"#{material_id} — {material_type}\n"
-            f"👤 User ID: <code>{user_id}</code>\n"
-            f"🕐 {created_at}\n\n"
+            f"👤 ID: <code>{telegram_id}</code>\n"
+            f"📄 {title}\n\n"
         )
 
-    await message.answer(text, parse_mode="HTML")
-
-
-# =========================================================
-# ADMIN FILES
-# =========================================================
-
-@router.message(Command("files"))
-async def admin_files(message: Message):
-
-    if not is_admin(message.from_user.id):
-        return
-
-    connection = db()
-    cursor = connection.cursor()
-
-    cursor.execute("""
-        SELECT id, user_id, filename, created_at
-        FROM files
-        ORDER BY id DESC
-        LIMIT 20
-    """)
-
-    rows = cursor.fetchall()
-
-    connection.close()
-
-    if not rows:
-        await message.answer("Файлов пока нет.")
-        return
-
-    text = "📚 <b>Последние файлы</b>\n\n"
-
-    for file_id, user_id, filename, created_at in rows:
-
-        text += (
-            f"#{file_id} — {filename}\n"
-            f"👤 User ID: <code>{user_id}</code>\n"
-            f"🕐 {created_at}\n\n"
-        )
-
-    await message.answer(text, parse_mode="HTML")
-
-
-# =========================================================
-# FILE UPLOAD
-# =========================================================
-
-@router.message(F.document)
-async def receive_document(message: Message):
-
-    save_user(message)
-
-    document = message.document
-
-    if document.file_size and document.file_size > MAX_FILE_SIZE:
-        await message.answer(
-            "❌ Файл слишком большой.\n"
-            "Максимальный размер: 20 МБ."
-        )
-        return
-
-    filename = document.file_name or "file"
-
-    extension = Path(filename).suffix.lower()
-
-    allowed = [".pdf", ".docx", ".txt", ".md"]
-
-    if extension not in allowed:
-        await message.answer(
-            "❌ Я пока поддерживаю только:\n\n"
-            "📕 PDF\n"
-            "📘 DOCX\n"
-            "📄 TXT\n"
-            "📝 MD"
-        )
-        return
-
-    user_dir = UPLOAD_DIR / str(message.from_user.id)
-    user_dir.mkdir(parents=True, exist_ok=True)
-
-    destination = user_dir / filename
-
-    try:
-
-        telegram_file = await bot.get_file(document.file_id)
-
-        await bot.download_file(
-            telegram_file.file_path,
-            destination
-        )
-
-        text = extract_text(str(destination))
-
-        if not text.strip():
-            await message.answer(
-                "⚠️ Файл загружен, но текст извлечь не удалось."
-            )
-            return
-
-        connection = db()
-        cursor = connection.cursor()
-
-        cursor.execute("""
-            INSERT INTO files (
-                user_id,
-                filename,
-                path,
-                created_at
-            )
-            VALUES (?, ?, ?, ?)
-        """, (
-            message.from_user.id,
-            filename,
-            str(destination),
-            datetime.now().isoformat()
-        ))
-
-        connection.commit()
-        connection.close()
-
-        # Сохраняем текст рядом с файлом
-        text_path = destination.with_suffix(".txt")
-
-        text_path.write_text(
-            text,
-            encoding="utf-8"
-        )
-
-        await message.answer(
-            f"✅ Файл <b>{filename}</b> загружен.\n\n"
-            f"Извлечено символов: <b>{len(text):,}</b>\n\n"
-            "Теперь можешь написать, например:\n"
-            "«Сделай конспект по этому файлу»\n"
-            "или\n"
-            "«Напиши реферат, используя этот материал».",
-            parse_mode="HTML"
-        )
-
-    except Exception as error:
-
-        print("FILE ERROR:", repr(error))
-
-        await message.answer(
-            "❌ Произошла ошибка при обработке файла."
-        )
-
-
-# =========================================================
-# TEXT REQUEST
-# =========================================================
-
-@router.message(F.text)
-async def text_request(message: Message):
-
-    save_user(message)
-
-    user_text = message.text.strip()
-
-    if not user_text:
-        return
-
-    # Не обрабатываем команды
-    if user_text.startswith("/"):
-        return
-
-    await message.answer("🧠 Думаю над ответом...")
-
-    # Ищем последний загруженный файл пользователя
-    connection = db()
-    cursor = connection.cursor()
-
-    cursor.execute("""
-        SELECT path
-        FROM files
-        WHERE user_id = ?
-        ORDER BY id DESC
-        LIMIT 1
-    """, (message.from_user.id,))
-
-    row = cursor.fetchone()
-
-    connection.close()
-
-    source_text = ""
-
-    if row:
-        file_path = Path(row[0])
-
-        text_path = file_path.with_suffix(".txt")
-
-        if text_path.exists():
-            try:
-                source_text = text_path.read_text(
-                    encoding="utf-8",
-                    errors="ignore"
-                )
-            except Exception:
-                source_text = ""
-
-    if len(source_text) > 60000:
-        source_text = source_text[:60000]
-
-    prompt = f"""
-Ты — Zolog AI, интеллектуальный учебный помощник.
-
-Пользователь написал:
-{user_text}
-
-Если ниже есть материал из загруженного пользователем файла,
-используй его как основной источник информации.
-
-Материал пользователя:
---------------------
-{source_text}
---------------------
-
-Правила:
-1. Отвечай на языке пользователя.
-2. Не выдумывай факты, если вопрос требует конкретной информации.
-3. Если пользователь просит реферат — создай структурированный реферат.
-4. Если просит курсовую — создай подробный план и академический текст.
-5. Если просит конспект — сделай структурированный конспект.
-6. Используй загруженный материал, когда он релевантен.
-7. Пиши понятно и грамотно.
-"""
-
-    try:
-
-        answer = await ask_gemini(prompt)
-
-        save_material(
-            message.from_user.id,
-            "ai_request",
-            user_text,
-            answer
-        )
-
-        # Telegram ограничивает длину одного сообщения
-        max_length = 4000
-
-        for i in range(0, len(answer), max_length):
-
-            await message.answer(
-                answer[i:i + max_length]
-            )
-
-        except Exception as error:
-
-        print("================================")
-        print("GEMINI ERROR")
-        print("================================")
-        print(type(error).__name__)
-        print(str(error))
-        print(repr(error))
-        print("================================")
-
-        await message.answer(
-            "❌ Ошибка Gemini.\n\n"
-            "Я записал подробности ошибки в логи Render."
-        )
-
-
-# =========================================================
-# HEALTH SERVER FOR RENDER
-# =========================================================
+    await message.answer(
+        text,
+        parse_mode="HTML"
+    )
+
+
+# =========================
+# ОБЫЧНЫЕ СООБЩЕНИЯ
+# =========================
+
+@dp.message()
+async def message_handler(message: types.Message):
+    add_user(message.from_user)
+
+    prompt = (
+        "Ты — Zolog AI, интеллектуальный помощник.\n"
+        "Отвечай понятно, структурированно и по существу.\n"
+        "Если вопрос учебный — объясняй материал так, "
+        "чтобы студент мог его понять и использовать в учебе.\n\n"
+        f"Запрос пользователя:\n{message.text}"
+    )
+
+    answer = await ask_ai(prompt)
+
+    save_material(
+        telegram_id=message.from_user.id,
+        material_type="ai_answer",
+        title=message.text[:100],
+        content=answer
+    )
+
+    await message.answer(answer)
+
+
+# =========================
+# HEALTH CHECK ДЛЯ RENDER
+# =========================
 
 async def health(request):
     return web.Response(
@@ -697,17 +436,24 @@ async def health(request):
 
 
 async def start_web_server():
-
     app = web.Application()
 
-    app.router.add_get("/", health)
-    app.router.add_get("/health", health)
+    app.router.add_get(
+        "/",
+        health
+    )
 
-    port = int(os.getenv("PORT", "10000"))
+    app.router.add_get(
+        "/health",
+        health
+    )
 
     runner = web.AppRunner(app)
-
     await runner.setup()
+
+    port = int(
+        os.getenv("PORT", "10000")
+    )
 
     site = web.TCPSite(
         runner,
@@ -717,33 +463,37 @@ async def start_web_server():
 
     await site.start()
 
-    print(f"Health server started on port {port}")
+    logger.info(
+        "Health server started on port %s",
+        port
+    )
 
 
-# =========================================================
-# BOT START
-# =========================================================
+# =========================
+# ЗАПУСК
+# =========================
 
 async def main():
+    logger.info("Запуск Zolog AI...")
 
     init_db()
 
-    dp.include_router(router)
-
     await start_web_server()
-
-    print("================================")
-    print("ZOLOG AI STARTED")
-    print("================================")
-    print("Model:", GEMINI_MODEL)
-    print("Admin ID:", ADMIN_ID)
 
     await bot.delete_webhook(
         drop_pending_updates=True
+    )
+
+    logger.info(
+        "Bot started. Model: %s",
+        GEMINI_MODEL
     )
 
     await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Bot stopped")
