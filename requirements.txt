@@ -1,7 +1,3 @@
 aiogram
 google-genai
 aiohttp
-pypdf
-python-docx
-python-pptx
-Pillow
