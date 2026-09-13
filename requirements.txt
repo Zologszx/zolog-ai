@@ -4,3 +4,4 @@ aiohttp
 pypdf
 python-docx
 python-pptx
+Pillow
