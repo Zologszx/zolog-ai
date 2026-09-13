@@ -1,59 +1,76 @@
-import asyncio
-import html
-import logging
 import os
+import re
+import json
+import time
 import sqlite3
-from datetime import datetime, timedelta
+import asyncio
+import logging
+from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command
 from aiogram.types import (
-    CallbackQuery,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    LabeledPrice,
     Message,
+    CallbackQuery,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    FSInputFile,
+    LabeledPrice,
     PreCheckoutQuery,
 )
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+
 from google import genai
 from google.genai import types
+
 from pypdf import PdfReader
 from docx import Document
+from pptx import Presentation
+from pptx.util import Inches, Pt
 
 
 # ============================================================
 # CONFIG
 # ============================================================
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or 0)
 
-# Основная бесплатная модель
 GEMINI_MODEL = os.getenv(
     "GEMINI_MODEL",
     "gemini-3.6-flash"
 )
 
-# Резервная бесплатная модель
 GEMINI_FALLBACK_MODEL = os.getenv(
     "GEMINI_FALLBACK_MODEL",
     "gemini-3.1-flash-lite"
 )
 
+ADDZOLOG_SECRET = os.getenv("ADDZOLOG_SECRET", "")
+
 PORT = int(os.getenv("PORT", "10000"))
 
-DB_PATH = "zolog_ai.db"
-FILES_DIR = Path("user_files")
-FILES_DIR.mkdir(exist_ok=True)
-
+MAX_BOOKS_PER_JOB = 10
+MAX_FILE_SIZE = 50 * 1024 * 1024
 START_GENERATIONS = 10
 REFERRAL_REWARD = 1
 
-# Повторные попытки
-RETRY_DELAYS = [3, 6, 12, 20]
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+BOOKS_DIR = BASE_DIR / "user_files"
+OUTPUTS_DIR = BASE_DIR / "outputs"
+
+DATA_DIR.mkdir(exist_ok=True)
+BOOKS_DIR.mkdir(exist_ok=True)
+OUTPUTS_DIR.mkdir(exist_ok=True)
+
+DB_PATH = DATA_DIR / "zolog.db"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -64,486 +81,362 @@ logger = logging.getLogger("zolog-ai")
 
 
 # ============================================================
-# CHECK CONFIG
+# GEMINI
 # ============================================================
 
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN не найден в Environment Variables")
+gemini_client = None
 
-if not GEMINI_API_KEY:
-    raise RuntimeError("GEMINI_API_KEY не найден в Environment Variables")
+if GEMINI_API_KEY:
+    try:
+        gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+    except Exception as e:
+        logger.exception("Gemini initialization error: %s", e)
 
 
 # ============================================================
-# BOT / AI
+# BOT / DP
 # ============================================================
 
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
-
-gemini = genai.Client(
-    api_key=GEMINI_API_KEY
-)
+bot = Bot(BOT_TOKEN)
+dp = Dispatcher(storage=MemoryStorage())
 
 
 # ============================================================
 # DATABASE
 # ============================================================
 
-db = sqlite3.connect(
-    DB_PATH,
-    check_same_thread=False
-)
-
-db.row_factory = sqlite3.Row
+def db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
 def init_db():
-    cursor = db.cursor()
+    conn = db()
+    cur = conn.cursor()
 
-    cursor.execute("""
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
-            telegram_id INTEGER PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            telegram_id INTEGER UNIQUE,
             username TEXT,
             first_name TEXT,
             language TEXT DEFAULT 'ru',
             generations INTEGER DEFAULT 10,
-            referrals_count INTEGER DEFAULT 0,
-            referred_by INTEGER,
-            is_blocked INTEGER DEFAULT 0,
-            created_at TEXT
+            is_banned INTEGER DEFAULT 0,
+            created_at TEXT,
+            last_seen TEXT
         )
     """)
 
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS materials (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            telegram_id INTEGER,
-            material_type TEXT,
-            title TEXT,
-            content TEXT,
-            created_at TEXT
-        )
-    """)
-
-    cursor.execute("""
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS books (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             telegram_id INTEGER,
             filename TEXT,
+            original_name TEXT,
             file_path TEXT,
+            file_type TEXT,
+            pages INTEGER DEFAULT 0,
             extracted_text TEXT,
             created_at TEXT
         )
     """)
 
-    cursor.execute("""
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS materials (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            telegram_id INTEGER,
+            material_type TEXT,
+            topic TEXT,
+            language TEXT,
+            volume INTEGER,
+            volume_type TEXT,
+            options TEXT,
+            status TEXT DEFAULT 'created',
+            file_path TEXT,
+            created_at TEXT
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            telegram_id INTEGER,
+            material_id INTEGER,
+            status TEXT DEFAULT 'waiting',
+            progress INTEGER DEFAULT 0,
+            stage TEXT,
+            error TEXT,
+            created_at TEXT,
+            updated_at TEXT
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS suggestions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            telegram_id INTEGER,
+            username TEXT,
+            text TEXT,
+            status TEXT DEFAULT 'new',
+            admin_reply TEXT,
+            created_at TEXT,
+            updated_at TEXT
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS admins (
+            telegram_id INTEGER PRIMARY KEY,
+            role TEXT NOT NULL DEFAULT 'moderator',
+            added_by INTEGER,
+            created_at TEXT
+        )
+    """)
+
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS payments (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             telegram_id INTEGER,
             package TEXT,
             stars INTEGER,
             generations INTEGER,
-            telegram_charge_id TEXT,
+            telegram_charge_id TEXT UNIQUE,
             created_at TEXT
         )
     """)
 
-    cursor.execute("""
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS referrals (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             inviter_id INTEGER,
-            invited_id INTEGER,
+            invited_id INTEGER UNIQUE,
             created_at TEXT
         )
     """)
 
-    cursor.execute("""
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            telegram_id INTEGER,
+            admin_id INTEGER,
             action TEXT,
+            target_id INTEGER,
             details TEXT,
             created_at TEXT
         )
     """)
 
-    db.commit()
+    # Первичный владелец
+    if ADMIN_ID:
+        cur.execute("""
+            INSERT OR IGNORE INTO admins
+            (telegram_id, role, added_by, created_at)
+            VALUES (?, 'owner', ?, ?)
+        """, (
+            ADMIN_ID,
+            ADMIN_ID,
+            datetime.now().isoformat()
+        ))
 
-
-init_db()
+    conn.commit()
+    conn.close()
 
 
 # ============================================================
-# HELPERS
+# USERS
 # ============================================================
 
-def now():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
-def log_action(
-    telegram_id: int,
-    action: str,
-    details: str = ""
-):
-    try:
-        db.execute(
-            """
-            INSERT INTO logs
-            (telegram_id, action, details, created_at)
-            VALUES (?, ?, ?, ?)
-            """,
-            (
-                telegram_id,
-                action,
-                details,
-                now()
-            )
-        )
-        db.commit()
-    except Exception as e:
-        logger.error(f"Ошибка логирования: {e}")
-
-
-def get_user(telegram_id: int):
-    return db.execute(
-        "SELECT * FROM users WHERE telegram_id = ?",
-        (telegram_id,)
-    ).fetchone()
-
-
-def create_user(message: Message):
+def ensure_user(message: Message):
     user = message.from_user
 
-    existing = get_user(user.id)
-
-    if existing:
-        db.execute(
-            """
-            UPDATE users
-            SET username = ?, first_name = ?
-            WHERE telegram_id = ?
-            """,
-            (
-                user.username,
-                user.first_name,
-                user.id
-            )
-        )
-        db.commit()
-        return existing
-
-    db.execute(
-        """
-        INSERT INTO users
-        (
-            telegram_id,
-            username,
-            first_name,
-            language,
-            generations,
-            created_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?)
-        """,
-        (
-            user.id,
-            user.username,
-            user.first_name,
-            "ru",
-            START_GENERATIONS,
-            now()
-        )
-    )
-
-    db.commit()
-
-    return get_user(user.id)
-
-
-def add_generations(
-    telegram_id: int,
-    amount: int
-):
-    db.execute(
-        """
-        UPDATE users
-        SET generations = generations + ?
-        WHERE telegram_id = ?
-        """,
-        (
-            amount,
-            telegram_id
-        )
-    )
-
-    db.commit()
-
-
-def remove_generation(telegram_id: int):
-    user = get_user(telegram_id)
-
     if not user:
-        return False
+        return
 
-    if user["generations"] <= 0:
-        return False
+    now = datetime.now().isoformat()
 
-    db.execute(
-        """
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        INSERT OR IGNORE INTO users
+        (telegram_id, username, first_name, generations, created_at, last_seen)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (
+        user.id,
+        user.username or "",
+        user.first_name or "",
+        START_GENERATIONS,
+        now,
+        now
+    ))
+
+    cur.execute("""
+        UPDATE users
+        SET username = ?,
+            first_name = ?,
+            last_seen = ?
+        WHERE telegram_id = ?
+    """, (
+        user.username or "",
+        user.first_name or "",
+        now,
+        user.id
+    ))
+
+    conn.commit()
+    conn.close()
+
+
+def get_user(user_id: int):
+    conn = db()
+    row = conn.execute(
+        "SELECT * FROM users WHERE telegram_id = ?",
+        (user_id,)
+    ).fetchone()
+    conn.close()
+    return row
+
+
+def get_generations(user_id: int) -> int:
+    row = get_user(user_id)
+    return int(row["generations"]) if row else 0
+
+
+def add_generations(user_id: int, amount: int):
+    conn = db()
+    conn.execute("""
+        UPDATE users
+        SET generations = MAX(0, generations + ?)
+        WHERE telegram_id = ?
+    """, (amount, user_id))
+    conn.commit()
+    conn.close()
+
+
+def set_generations(user_id: int, amount: int):
+    conn = db()
+    conn.execute("""
+        UPDATE users
+        SET generations = MAX(0, ?)
+        WHERE telegram_id = ?
+    """, (amount, user_id))
+    conn.commit()
+    conn.close()
+
+
+def spend_generation(user_id: int) -> bool:
+    conn = db()
+
+    cur = conn.execute("""
         UPDATE users
         SET generations = generations - 1
         WHERE telegram_id = ?
-        """,
-        (telegram_id,)
-    )
+          AND generations > 0
+          AND is_banned = 0
+    """, (user_id,))
 
-    db.commit()
+    success = cur.rowcount > 0
 
-    return True
+    conn.commit()
+    conn.close()
 
-
-def user_is_blocked(telegram_id: int):
-    user = get_user(telegram_id)
-
-    if not user:
-        return False
-
-    return bool(user["is_blocked"])
+    return success
 
 
 # ============================================================
-# AI ERROR DETECTION
+# ADMINS
 # ============================================================
 
-def is_rate_limit_error(error_text: str):
-    text = error_text.lower()
-
-    keywords = [
-        "429",
-        "resource_exhausted",
-        "quota",
-        "rate limit",
-        "too many requests",
-        "requests per minute",
-        "requests per day",
-        "quota exceeded",
-    ]
-
-    return any(
-        keyword in text
-        for keyword in keywords
-    )
+ROLE_OWNER = "owner"
+ROLE_ADMIN = "admin"
+ROLE_MODERATOR = "moderator"
+ROLE_ANALYST = "analyst"
 
 
-def is_temporary_error(error_text: str):
-    text = error_text.lower()
+def get_admin_role(user_id: int) -> Optional[str]:
+    conn = db()
+    row = conn.execute(
+        "SELECT role FROM admins WHERE telegram_id = ?",
+        (user_id,)
+    ).fetchone()
+    conn.close()
 
-    keywords = [
-        "503",
-        "unavailable",
-        "high demand",
-        "temporarily unavailable",
-        "internal server error",
-        "deadline exceeded",
-        "timeout",
-        "timed out",
-    ]
+    if not row:
+        return None
 
-    return any(
-        keyword in text
-        for keyword in keywords
-    )
+    return row["role"]
+
+
+def is_admin(user_id: int) -> bool:
+    return get_admin_role(user_id) is not None
+
+
+def is_owner(user_id: int) -> bool:
+    return get_admin_role(user_id) == ROLE_OWNER
+
+
+def admin_allowed(user_id: int, minimum="moderator") -> bool:
+    role = get_admin_role(user_id)
+
+    if role == ROLE_OWNER:
+        return True
+
+    levels = {
+        ROLE_ANALYST: 1,
+        ROLE_MODERATOR: 2,
+        ROLE_ADMIN: 3,
+        ROLE_OWNER: 4
+    }
+
+    return levels.get(role, 0) >= levels.get(minimum, 2)
+
+
+def log_admin(admin_id, action, target_id=None, details=""):
+    conn = db()
+    conn.execute("""
+        INSERT INTO logs
+        (admin_id, action, target_id, details, created_at)
+        VALUES (?, ?, ?, ?, ?)
+    """, (
+        admin_id,
+        action,
+        target_id,
+        details,
+        datetime.now().isoformat()
+    ))
+    conn.commit()
+    conn.close()
 
 
 # ============================================================
-# GEMINI AI
+# STATES
 # ============================================================
 
-async def ask_ai(prompt: str):
-    """
-    Система AI:
+class GenerationStates(StatesGroup):
+    waiting_books = State()
+    waiting_language = State()
+    waiting_type = State()
+    waiting_topic = State()
+    waiting_volume = State()
+    waiting_options = State()
+    waiting_confirmation = State()
 
-    1. Основная модель.
-    2. Если 429/лимит -> резервная модель.
-    3. Если 503/перегрузка -> повтор.
-    4. Повторные попытки:
-       3 -> 6 -> 12 -> 20 секунд.
-    5. Если основная модель не справилась,
-       переходим к резервной.
-    """
 
-    models = [
-        GEMINI_MODEL,
-        GEMINI_FALLBACK_MODEL
-    ]
+class SuggestionStates(StatesGroup):
+    waiting_text = State()
 
-    # Не используем одну и ту же модель дважды
-    unique_models = []
 
-    for model in models:
-        if model and model not in unique_models:
-            unique_models.append(model)
+class AskStates(StatesGroup):
+    waiting_question = State()
 
-    last_error = None
 
-    for model_index, model in enumerate(unique_models):
-
-        logger.info(
-            f"🤖 Используем модель: {model}"
-        )
-
-        attempt = 0
-
-        while attempt <= len(RETRY_DELAYS):
-
-            try:
-                response = await asyncio.to_thread(
-                    gemini.models.generate_content,
-                    model=model,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        temperature=0.7
-                    )
-                )
-
-                if response is None:
-                    raise RuntimeError(
-                        "Gemini вернул пустой ответ"
-                    )
-
-                text = getattr(
-                    response,
-                    "text",
-                    None
-                )
-
-                if text:
-                    logger.info(
-                        f"✅ Ответ получен через {model}"
-                    )
-
-                    return text
-
-                raise RuntimeError(
-                    "Gemini вернул ответ без текста"
-                )
-
-            except Exception as e:
-
-                error_text = str(e)
-                last_error = error_text
-
-                logger.error(
-                    f"❌ Ошибка {model}: {error_text}"
-                )
-
-                # --------------------------------------------
-                # 429 / QUOTA
-                # --------------------------------------------
-
-                if is_rate_limit_error(error_text):
-
-                    logger.warning(
-                        f"⚠️ Лимит модели {model}"
-                    )
-
-                    # Если есть резервная модель
-                    if model_index < len(unique_models) - 1:
-
-                        fallback = unique_models[
-                            model_index + 1
-                        ]
-
-                        logger.warning(
-                            f"🔄 Переключение "
-                            f"{model} -> {fallback}"
-                        )
-
-                        break
-
-                    # Резервная тоже получила лимит.
-                    # Делаем повторные попытки.
-                    if attempt < len(RETRY_DELAYS):
-
-                        delay = RETRY_DELAYS[attempt]
-
-                        logger.info(
-                            f"⏳ Повтор через {delay} сек."
-                        )
-
-                        await asyncio.sleep(delay)
-
-                        attempt += 1
-
-                        continue
-
-                    break
-
-                # --------------------------------------------
-                # 503 / TEMPORARY
-                # --------------------------------------------
-
-                if is_temporary_error(error_text):
-
-                    if attempt < len(RETRY_DELAYS):
-
-                        delay = RETRY_DELAYS[attempt]
-
-                        logger.warning(
-                            f"⏳ Временная ошибка. "
-                            f"Повтор через {delay} сек."
-                        )
-
-                        await asyncio.sleep(delay)
-
-                        attempt += 1
-
-                        continue
-
-                    # Если основная модель не отвечает,
-                    # переключаемся на резервную.
-                    if model_index < len(unique_models) - 1:
-
-                        fallback = unique_models[
-                            model_index + 1
-                        ]
-
-                        logger.warning(
-                            f"🔄 {model} недоступна. "
-                            f"Переходим на {fallback}"
-                        )
-
-                        break
-
-                    break
-
-                # --------------------------------------------
-                # ДРУГАЯ ОШИБКА
-                # --------------------------------------------
-
-                logger.error(
-                    f"❌ Неповторяемая ошибка: {error_text}"
-                )
-
-                # На всякий случай пробуем резервную
-                if model_index < len(unique_models) - 1:
-
-                    logger.warning(
-                        f"🔄 Пробуем резервную модель "
-                        f"{unique_models[model_index + 1]}"
-                    )
-
-                    break
-
-                break
-
-    logger.error(
-        f"❌ Все AI-модели недоступны: {last_error}"
-    )
-
-    return None
+class AdminStates(StatesGroup):
+    waiting_broadcast = State()
+    waiting_give_id = State()
+    waiting_give_amount = State()
+    waiting_add_admin_id = State()
+    waiting_suggestion_reply = State()
 
 
 # ============================================================
@@ -551,639 +444,2235 @@ async def ask_ai(prompt: str):
 # ============================================================
 
 def main_menu():
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="📝 Создать материал",
-                    callback_data="create_material"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🧠 Спросить AI",
-                    callback_data="ask_ai"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="📖 Загрузить книгу",
-                    callback_data="upload_book"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="📚 Моя библиотека",
-                    callback_data="library"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="👤 Профиль",
-                    callback_data="profile"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🎁 Пригласить друга",
-                    callback_data="referral"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="⭐ Получить генерации",
-                    callback_data="buy_generations"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🌐 Язык",
-                    callback_data="language"
-                ),
-                InlineKeyboardButton(
-                    text="⚙️ Настройки",
-                    callback_data="settings"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="ℹ️ Помощь",
-                    callback_data="help"
-                )
-            ]
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text="📝 Создать материал",
+                callback_data="create_material"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="🧠 Спросить AI",
+                callback_data="ask_ai"
+            ),
+            InlineKeyboardButton(
+                text="📖 Мои книги",
+                callback_data="my_books"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="📚 Мои материалы",
+                callback_data="my_materials"
+            ),
+            InlineKeyboardButton(
+                text="👤 Профиль",
+                callback_data="profile"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="🎁 Пригласить друга",
+                callback_data="referral"
+            ),
+            InlineKeyboardButton(
+                text="⭐ Получить генерации",
+                callback_data="buy_generations"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="🌐 Язык",
+                callback_data="language"
+            ),
+            InlineKeyboardButton(
+                text="⚙️ Настройки",
+                callback_data="settings"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="💡 Предложения по улучшению",
+                callback_data="suggestions"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="ℹ️ Помощь",
+                callback_data="help"
+            )
         ]
-    )
+    ])
 
 
-def material_menu():
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="📄 Реферат",
-                    callback_data="material_ref"
-                ),
-                InlineKeyboardButton(
-                    text="📚 Курсовая",
-                    callback_data="material_course"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🎓 Дипломная",
-                    callback_data="material_diploma"
-                ),
-                InlineKeyboardButton(
-                    text="📖 Конспект",
-                    callback_data="material_notes"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="📊 Презентация",
-                    callback_data="material_presentation"
-                ),
-                InlineKeyboardButton(
-                    text="📝 Эссе",
-                    callback_data="material_essay"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🔬 Доклад",
-                    callback_data="material_report"
-                ),
-                InlineKeyboardButton(
-                    text="🧠 Свой запрос",
-                    callback_data="material_custom"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="◀️ Назад",
-                    callback_data="back_main"
-                )
-            ]
+def back_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text="⬅️ Главное меню",
+                callback_data="main_menu"
+            )
         ]
-    )
+    ])
 
 
-def language_menu():
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="🇺🇦 Українська",
-                    callback_data="lang_uk"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🇷🇺 Русский",
-                    callback_data="lang_ru"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🇬🇧 English",
-                    callback_data="lang_en"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="◀️ Назад",
-                    callback_data="back_main"
-                )
-            ]
+def language_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text="🇺🇦 Українська",
+                callback_data="gen_lang_uk"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="🇷🇺 Русский",
+                callback_data="gen_lang_ru"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="🇬🇧 English",
+                callback_data="gen_lang_en"
+            )
         ]
-    )
+    ])
 
 
-def payment_menu():
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="⭐ 50 → 100 генераций",
-                    callback_data="buy_basic"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="⭐ 150 → 500 генераций",
-                    callback_data="buy_pro"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="⭐ 350 → 1500 генераций",
-                    callback_data="buy_premium"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="◀️ Назад",
-                    callback_data="back_main"
-                )
-            ]
+def material_types_keyboard():
+    types = [
+        ("📄 Реферат", "ref"),
+        ("📑 Курсовая", "course"),
+        ("🎓 Дипломная", "thesis"),
+        ("📋 Доклад", "report"),
+        ("📚 Конспект", "summary"),
+        ("📊 Презентация", "presentation"),
+        ("✍️ Эссе", "essay"),
+        ("📝 Свой запрос", "custom")
+    ]
+
+    rows = []
+
+    for name, code in types:
+        rows.append([
+            InlineKeyboardButton(
+                text=name,
+                callback_data=f"gen_type_{code}"
+            )
+        ])
+
+    rows.append([
+        InlineKeyboardButton(
+            text="⬅️ Назад",
+            callback_data="create_material"
+        )
+    ])
+
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def confirmation_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text="✅ Начать генерацию",
+                callback_data="generation_start"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="✏️ Изменить параметры",
+                callback_data="generation_edit"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="❌ Отмена",
+                callback_data="main_menu"
+            )
         ]
-    )
+    ])
 
 
-def admin_menu():
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="📊 Dashboard",
-                    callback_data="admin_dashboard"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="👥 Пользователи",
-                    callback_data="admin_users"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🗄️ Материалы",
-                    callback_data="admin_materials"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="📚 Книги",
-                    callback_data="admin_books"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🤖 AI",
-                    callback_data="admin_ai"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🎁 Рефералы",
-                    callback_data="admin_referrals"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="💳 Оплаты",
-                    callback_data="admin_payments"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="📈 Статистика оплат",
-                    callback_data="admin_payment_stats"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="📢 Рассылки",
-                    callback_data="admin_broadcast"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🛡️ Модерация",
-                    callback_data="admin_moderation"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="📝 Логи",
-                    callback_data="admin_logs"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🧪 Test Mode",
-                    callback_data="admin_test"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="⚙️ Настройки",
-                    callback_data="admin_settings"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="◀️ В главное меню",
-                    callback_data="back_main"
-                )
-            ]
+def book_upload_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text="➕ Добавить книгу",
+                callback_data="book_add"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="➡️ Продолжить",
+                callback_data="books_continue"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="❌ Отмена",
+                callback_data="main_menu"
+            )
         ]
-    )
+    ])
+
+
+def presentation_options_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text="🖼 Изображения: Да",
+                callback_data="opt_images_yes"
+            ),
+            InlineKeyboardButton(
+                text="🖼 Изображения: Нет",
+                callback_data="opt_images_no"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="📊 Таблицы/схемы: Да",
+                callback_data="opt_tables_yes"
+            ),
+            InlineKeyboardButton(
+                text="📊 Таблицы/схемы: Нет",
+                callback_data="opt_tables_no"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="🎤 Заметки докладчика: Да",
+                callback_data="opt_notes_yes"
+            ),
+            InlineKeyboardButton(
+                text="🎤 Заметки: Нет",
+                callback_data="opt_notes_no"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="➡️ Далее",
+                callback_data="options_continue"
+            )
+        ]
+    ])
+
+
+def academic_options_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text="📑 Содержание",
+                callback_data="academic_toc"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="📚 Список литературы",
+                callback_data="academic_refs"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="📊 Таблицы",
+                callback_data="academic_tables"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="📐 Схемы",
+                callback_data="academic_schemes"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="📎 Приложения",
+                callback_data="academic_appendices"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="➡️ Далее",
+                callback_data="options_continue"
+            )
+        ]
+    ])
 
 
 # ============================================================
-# USER STATES
+# START
 # ============================================================
 
-# Так как проект в одном файле,
-# состояние пользователя храним здесь.
-user_states = {}
+@dp.message(Command("start"))
+async def start_handler(message: Message, state: FSMContext):
+    ensure_user(message)
 
-
-def set_state(
-    telegram_id: int,
-    state: str
-):
-    user_states[telegram_id] = state
-
-
-def get_state(telegram_id: int):
-    return user_states.get(telegram_id)
-
-
-def clear_state(telegram_id: int):
-    user_states.pop(telegram_id, None)
-
-
-# ============================================================
-# /START
-# ============================================================
-
-@dp.message(CommandStart())
-async def start_handler(message: Message):
-
-    user = create_user(message)
-
-    telegram_id = message.from_user.id
-
-    # --------------------------------------------
-    # REFERRAL
-    # --------------------------------------------
+    await state.clear()
 
     args = message.text.split(maxsplit=1)
 
-    if len(args) > 1:
+    if len(args) > 1 and args[1].startswith("ref_"):
+        try:
+            inviter_id = int(args[1][4:])
 
-        referral_code = args[1]
+            if inviter_id != message.from_user.id:
+                conn = db()
 
-        if referral_code.startswith("ref_"):
+                existing = conn.execute("""
+                    SELECT id FROM referrals
+                    WHERE invited_id = ?
+                """, (message.from_user.id,)).fetchone()
 
-            try:
-                inviter_id = int(
-                    referral_code.replace(
-                        "ref_",
-                        "",
-                        1
-                    )
-                )
+                if not existing:
+                    conn.execute("""
+                        INSERT INTO referrals
+                        (inviter_id, invited_id, created_at)
+                        VALUES (?, ?, ?)
+                    """, (
+                        inviter_id,
+                        message.from_user.id,
+                        datetime.now().isoformat()
+                    ))
 
-                # Нельзя пригласить самого себя
-                if inviter_id != telegram_id:
+                    conn.commit()
+                    conn.close()
 
-                    current_user = get_user(
-                        telegram_id
-                    )
+                    add_generations(inviter_id, REFERRAL_REWARD)
 
-                    # Только если пользователь новый
-                    # и ещё не имеет пригласившего
-                    if (
-                        current_user
-                        and current_user["referred_by"] is None
-                    ):
-
-                        inviter = get_user(
-                            inviter_id
+                    try:
+                        await bot.send_message(
+                            inviter_id,
+                            f"🎉 По вашей ссылке зарегистрировался новый пользователь!\n"
+                            f"Вам начислено +{REFERRAL_REWARD} генерация."
                         )
+                    except Exception:
+                        pass
 
-                        if inviter:
+                else:
+                    conn.close()
 
-                            db.execute(
-                                """
-                                UPDATE users
-                                SET referred_by = ?
-                                WHERE telegram_id = ?
-                                """,
-                                (
-                                    inviter_id,
-                                    telegram_id
-                                )
-                            )
-
-                            db.execute(
-                                """
-                                UPDATE users
-                                SET
-                                    referrals_count =
-                                    referrals_count + 1,
-                                    generations =
-                                    generations + ?
-                                WHERE telegram_id = ?
-                                """,
-                                (
-                                    REFERRAL_REWARD,
-                                    inviter_id
-                                )
-                            )
-
-                            db.execute(
-                                """
-                                INSERT INTO referrals
-                                (
-                                    inviter_id,
-                                    invited_id,
-                                    created_at
-                                )
-                                VALUES (?, ?, ?)
-                                """,
-                                (
-                                    inviter_id,
-                                    telegram_id,
-                                    now()
-                                )
-                            )
-
-                            db.commit()
-
-                            log_action(
-                                inviter_id,
-                                "referral",
-                                f"Приглашён пользователь {telegram_id}"
-                            )
-
-                            try:
-                                await bot.send_message(
-                                    inviter_id,
-                                    "🎉 Новый пользователь "
-                                    "перешёл по вашей ссылке!\n\n"
-                                    f"Вам начислена "
-                                    f"+{REFERRAL_REWARD} генерация."
-                                )
-                            except Exception:
-                                pass
-
-            except ValueError:
-                pass
-
-    clear_state(telegram_id)
+        except Exception:
+            pass
 
     await message.answer(
-        "🤖 <b>Zolog AI</b>\n\n"
-        "Добро пожаловать!\n\n"
-        "Я помогу создавать учебные материалы, "
-        "работать с книгами и отвечать на вопросы.\n\n"
-        f"🎁 Ваш баланс: "
-        f"<b>{user['generations']}</b> генераций",
-        reply_markup=main_menu(),
-        parse_mode="HTML"
-    )
-
-
-# ============================================================
-# TEXT MAIN COMMAND
-# ============================================================
-
-@dp.message(Command("menu"))
-async def menu_command(message: Message):
-
-    create_user(message)
-
-    clear_state(
-        message.from_user.id
-    )
-
-    await message.answer(
-        "🏠 Главное меню",
+        "🤖 Добро пожаловать в Zolog AI!\n\n"
+        "Я помогу создавать учебные материалы "
+        "на основе загруженных вами книг.\n\n"
+        "📚 Главное правило:\n"
+        "для академических материалов используются только "
+        "загруженные вами источники.\n\n"
+        f"🎁 Ваш баланс: {get_generations(message.from_user.id)} генераций.",
         reply_markup=main_menu()
     )
 
 
 # ============================================================
-# PROFILE
+# MAIN MENU
 # ============================================================
 
-async def show_profile(
-    telegram_id: int,
-    target: Message | CallbackQuery
-):
+@dp.callback_query(F.data == "main_menu")
+async def main_menu_callback(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
 
-    user = get_user(telegram_id)
-
-    if not user:
-        return
-
-    username = (
-        f"@{user['username']}"
-        if user["username"]
-        else "не указан"
+    await callback.message.edit_text(
+        "🤖 Zolog AI\n\nВыберите действие:",
+        reply_markup=main_menu()
     )
-
-    text = (
-        "👤 <b>Профиль</b>\n\n"
-        f"Имя: <b>{html.escape(user['first_name'] or '')}</b>\n"
-        f"Username: {username}\n"
-        f"ID: <code>{telegram_id}</code>\n\n"
-        f"⭐ Генераций: <b>{user['generations']}</b>\n"
-        f"🎁 Приглашено: <b>{user['referrals_count']}</b>\n"
-        f"🌐 Язык: <b>{user['language']}</b>"
-    )
-
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="◀️ Назад",
-                    callback_data="back_main"
-                )
-            ]
-        ]
-    )
-
-    if isinstance(target, CallbackQuery):
-
-        await target.message.edit_text(
-            text,
-            reply_markup=keyboard,
-            parse_mode="HTML"
-        )
-
-    else:
-
-        await target.answer(
-            text,
-            reply_markup=keyboard,
-            parse_mode="HTML"
-        )
-
-
-# ============================================================
-# REFERRAL
-# ============================================================
-
-async def show_referral(
-    telegram_id: int,
-    target: CallbackQuery
-):
-
-    user = get_user(telegram_id)
-
-    if not user:
-        return
-
-    bot_info = await bot.get_me()
-
-    link = (
-        f"https://t.me/"
-        f"{bot_info.username}"
-        f"?start=ref_{telegram_id}"
-    )
-
-    text = (
-        "🎁 <b>Реферальная система</b>\n\n"
-        "Приглашай друзей в Zolog AI.\n\n"
-        f"За каждого нового пользователя "
-        f"ты получаешь <b>+{REFERRAL_REWARD}</b> генерацию.\n\n"
-        f"👥 Приглашено: "
-        f"<b>{user['referrals_count']}</b>\n\n"
-        "🔗 Твоя ссылка:\n"
-        f"<code>{link}</code>"
-    )
-
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="◀️ Назад",
-                    callback_data="back_main"
-                )
-            ]
-        ]
-    )
-
-    await target.message.edit_text(
-        text,
-        reply_markup=keyboard,
-        parse_mode="HTML"
-    )
-
-
-# ============================================================
-# MATERIAL GENERATION
-# ============================================================
-
-MATERIAL_NAMES = {
-    "material_ref": "Реферат",
-    "material_course": "Курсовая работа",
-    "material_diploma": "Дипломная работа",
-    "material_notes": "Конспект",
-    "material_presentation": "Презентация",
-    "material_essay": "Эссе",
-    "material_report": "Доклад",
-}
-
-
-@dp.callback_query(F.data == "create_material")
-async def create_material_callback(
-    callback: CallbackQuery
-):
 
     await callback.answer()
 
-    clear_state(
-        callback.from_user.id
+
+# ============================================================
+# GENERATION — START
+# ============================================================
+
+@dp.callback_query(F.data == "create_material")
+async def create_material(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+
+    await state.set_state(GenerationStates.waiting_books)
+    await state.update_data(
+        books=[],
+        language=None,
+        material_type=None,
+        topic=None,
+        volume=None,
+        volume_type=None,
+        options={}
     )
 
     await callback.message.edit_text(
-        "📝 <b>Выберите тип материала:</b>",
-        reply_markup=material_menu(),
-        parse_mode="HTML"
+        "📝 Создание нового материала\n\n"
+        "Шаг 1 из 6 — загрузка источников.\n\n"
+        "📚 Сначала отправьте мне книгу или несколько книг, "
+        "на основе которых нужно создать материал.\n\n"
+        f"Можно загрузить до {MAX_BOOKS_PER_JOB} книг для одной работы.\n\n"
+        "Поддерживаются:\n"
+        "• PDF\n"
+        "• DOCX\n"
+        "• TXT\n\n"
+        "После загрузки книг нажмите «➡️ Продолжить».",
+        reply_markup=book_upload_keyboard()
+    )
+
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "book_add")
+async def book_add(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    books = data.get("books", [])
+
+    if len(books) >= MAX_BOOKS_PER_JOB:
+        await callback.answer(
+            f"Можно использовать максимум {MAX_BOOKS_PER_JOB} книг.",
+            show_alert=True
+        )
+        return
+
+    await callback.message.answer(
+        f"📖 Отправьте следующую книгу.\n\n"
+        f"Загружено: {len(books)}/{MAX_BOOKS_PER_JOB}"
+    )
+
+    await callback.answer()
+
+
+@dp.message(GenerationStates.waiting_books, F.document)
+async def generation_book_upload(
+    message: Message,
+    state: FSMContext
+):
+    ensure_user(message)
+
+    data = await state.get_data()
+    books = data.get("books", [])
+
+    if len(books) >= MAX_BOOKS_PER_JOB:
+        await message.answer(
+            f"❌ Максимум — {MAX_BOOKS_PER_JOB} книг."
+        )
+        return
+
+    document = message.document
+
+    if document.file_size and document.file_size > MAX_FILE_SIZE:
+        await message.answer(
+            "❌ Файл слишком большой.\n"
+            "Максимальный размер — 50 МБ."
+        )
+        return
+
+    original_name = document.file_name or "book"
+
+    extension = Path(original_name).suffix.lower()
+
+    if extension not in [".pdf", ".docx", ".txt"]:
+        await message.answer(
+            "❌ Этот формат не поддерживается.\n"
+            "Используйте PDF, DOCX или TXT."
+        )
+        return
+
+    user_dir = BOOKS_DIR / str(message.from_user.id)
+    user_dir.mkdir(parents=True, exist_ok=True)
+
+    safe_name = re.sub(
+        r"[^a-zA-Zа-яА-Я0-9._-]",
+        "_",
+        original_name
+    )
+
+    filename = f"{int(time.time())}_{safe_name}"
+    path = user_dir / filename
+
+    try:
+        file = await bot.get_file(document.file_id)
+        await bot.download_file(file.file_path, destination=path)
+
+        extracted_text, pages = extract_document(path, extension)
+
+        if not extracted_text.strip():
+            await message.answer(
+                "❌ Не удалось извлечь текст из файла."
+            )
+            path.unlink(missing_ok=True)
+            return
+
+        conn = db()
+
+        cur = conn.execute("""
+            INSERT INTO books
+            (
+                telegram_id,
+                filename,
+                original_name,
+                file_path,
+                file_type,
+                pages,
+                extracted_text,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            message.from_user.id,
+            filename,
+            original_name,
+            str(path),
+            extension,
+            pages,
+            extracted_text,
+            datetime.now().isoformat()
+        ))
+
+        book_id = cur.lastrowid
+
+        conn.commit()
+        conn.close()
+
+        books.append(book_id)
+
+        await state.update_data(books=books)
+
+        await message.answer(
+            f"✅ Книга добавлена!\n\n"
+            f"📖 {original_name}\n"
+            f"📄 Страниц: {pages}\n\n"
+            f"📚 Загружено для этой работы: "
+            f"{len(books)}/{MAX_BOOKS_PER_JOB}",
+            reply_markup=book_upload_keyboard()
+        )
+
+    except Exception as e:
+        logger.exception("Book upload error: %s", e)
+
+        await message.answer(
+            "❌ Не удалось обработать книгу."
+        )
+
+
+@dp.callback_query(
+    F.data == "books_continue",
+    GenerationStates.waiting_books
+)
+async def books_continue(
+    callback: CallbackQuery,
+    state: FSMContext
+):
+    data = await state.get_data()
+    books = data.get("books", [])
+
+    if not books:
+        await callback.answer(
+            "Сначала загрузите хотя бы одну книгу.",
+            show_alert=True
+        )
+        return
+
+    await state.set_state(
+        GenerationStates.waiting_language
+    )
+
+    await callback.message.edit_text(
+        "🌐 Шаг 2 из 6 — выберите язык материала:",
+        reply_markup=language_keyboard()
+    )
+
+    await callback.answer()
+
+
+# ============================================================
+# LANGUAGE
+# ============================================================
+
+@dp.callback_query(
+    F.data.startswith("gen_lang_"),
+    GenerationStates.waiting_language
+)
+async def generation_language(
+    callback: CallbackQuery,
+    state: FSMContext
+):
+    lang_code = callback.data.replace("gen_lang_", "")
+
+    names = {
+        "ru": "🇷🇺 Русский",
+        "uk": "🇺🇦 Українська",
+        "en": "🇬🇧 English"
+    }
+
+    await state.update_data(language=lang_code)
+
+    await state.set_state(
+        GenerationStates.waiting_type
+    )
+
+    await callback.message.edit_text(
+        "📑 Шаг 3 из 6 — выберите тип материала:",
+        reply_markup=material_types_keyboard()
+    )
+
+    await callback.answer(
+        f"Выбран язык: {names.get(lang_code, lang_code)}"
+    )
+
+
+# ============================================================
+# MATERIAL TYPE
+# ============================================================
+
+@dp.callback_query(
+    F.data.startswith("gen_type_"),
+    GenerationStates.waiting_type
+)
+async def generation_type(
+    callback: CallbackQuery,
+    state: FSMContext
+):
+    material_type = callback.data.replace(
+        "gen_type_",
+        ""
+    )
+
+    names = {
+        "ref": "Реферат",
+        "course": "Курсовая",
+        "thesis": "Дипломная",
+        "report": "Доклад",
+        "summary": "Конспект",
+        "presentation": "Презентация",
+        "essay": "Эссе",
+        "custom": "Свой запрос"
+    }
+
+    await state.update_data(
+        material_type=material_type
+    )
+
+    await state.set_state(
+        GenerationStates.waiting_topic
+    )
+
+    await callback.message.edit_text(
+        f"📑 Тип: {names.get(material_type)}\n\n"
+        "Шаг 4 из 6.\n\n"
+        "Напишите тему материала.\n\n"
+        "Например:\n"
+        "«Фізична терапія при ХОЗЛ»"
+    )
+
+    await callback.answer()
+
+
+# ============================================================
+# TOPIC
+# ============================================================
+
+@dp.message(GenerationStates.waiting_topic, F.text)
+async def generation_topic(
+    message: Message,
+    state: FSMContext
+):
+    topic = message.text.strip()
+
+    if len(topic) < 3:
+        await message.answer(
+            "❌ Тема слишком короткая. "
+            "Напишите тему подробнее."
+        )
+        return
+
+    await state.update_data(topic=topic)
+
+    data = await state.get_data()
+
+    material_type = data.get("material_type")
+
+    await state.set_state(
+        GenerationStates.waiting_volume
+    )
+
+    if material_type == "presentation":
+        await message.answer(
+            "📊 Шаг 5 из 6 — объём презентации.\n\n"
+            "Напишите количество слайдов.\n\n"
+            "Например: 15"
+        )
+
+    elif material_type == "summary":
+        await message.answer(
+            "📚 Шаг 5 из 6 — объём конспекта.\n\n"
+            "Напишите примерный объём в страницах.\n\n"
+            "Например: 5"
+        )
+
+    else:
+        await message.answer(
+            "📄 Шаг 5 из 6 — необходимый объём.\n\n"
+            "Напишите количество страниц.\n\n"
+            "Например: 20"
+        )
+
+
+# ============================================================
+# VOLUME
+# ============================================================
+
+@dp.message(GenerationStates.waiting_volume, F.text)
+async def generation_volume(
+    message: Message,
+    state: FSMContext
+):
+    text = message.text.strip()
+
+    match = re.search(r"\d+", text)
+
+    if not match:
+        await message.answer(
+            "❌ Укажите количество числом.\n"
+            "Например: 15"
+        )
+        return
+
+    volume = int(match.group())
+
+    if volume <= 0:
+        await message.answer(
+            "❌ Объём должен быть больше нуля."
+        )
+        return
+
+    if volume > 200:
+        await message.answer(
+            "❌ Слишком большой объём для одной генерации.\n"
+            "Укажите до 200 страниц/слайдов."
+        )
+        return
+
+    data = await state.get_data()
+
+    material_type = data.get("material_type")
+
+    volume_type = (
+        "слайдов"
+        if material_type == "presentation"
+        else "страниц"
+    )
+
+    await state.update_data(
+        volume=volume,
+        volume_type=volume_type
+    )
+
+    await state.set_state(
+        GenerationStates.waiting_options
+    )
+
+    if material_type == "presentation":
+        await message.answer(
+            "🎨 Дополнительные параметры презентации:",
+            reply_markup=presentation_options_keyboard()
+        )
+
+    elif material_type in [
+        "course",
+        "thesis",
+        "ref"
+    ]:
+        await message.answer(
+            "⚙️ Дополнительные параметры работы:",
+            reply_markup=academic_options_keyboard()
+        )
+
+    else:
+        await show_confirmation(message, state)
+
+
+# ============================================================
+# OPTIONS
+# ============================================================
+
+async def show_confirmation(
+    message: Message,
+    state: FSMContext
+):
+    data = await state.get_data()
+
+    language_names = {
+        "ru": "🇷🇺 Русский",
+        "uk": "🇺🇦 Українська",
+        "en": "🇬🇧 English"
+    }
+
+    type_names = {
+        "ref": "Реферат",
+        "course": "Курсовая",
+        "thesis": "Дипломная",
+        "report": "Доклад",
+        "summary": "Конспект",
+        "presentation": "Презентация",
+        "essay": "Эссе",
+        "custom": "Свой запрос"
+    }
+
+    books = data.get("books", [])
+
+    options = data.get("options", {})
+
+    option_text = []
+
+    for key, value in options.items():
+        if value:
+            option_text.append(
+                f"• {key}: {value}"
+            )
+
+    if not option_text:
+        option_text.append(
+            "• Дополнительные параметры не выбраны"
+        )
+
+    await state.set_state(
+        GenerationStates.waiting_confirmation
+    )
+
+    text = (
+        "🔎 ПРОВЕРКА ПАРАМЕТРОВ\n\n"
+        f"📚 Источников: {len(books)}\n"
+        f"🌐 Язык: {language_names.get(data.get('language'))}\n"
+        f"📑 Тип: {type_names.get(data.get('material_type'))}\n"
+        f"📝 Тема: {data.get('topic')}\n"
+        f"📐 Объём: {data.get('volume')} "
+        f"{data.get('volume_type')}\n\n"
+        "⚙️ Дополнительные параметры:\n"
+        + "\n".join(option_text)
+        + "\n\n"
+        "⚠️ Генерация будет списана только после "
+        "нажатия «Начать генерацию»."
+    )
+
+    await message.answer(
+        text,
+        reply_markup=confirmation_keyboard()
     )
 
 
 @dp.callback_query(
-    F.data.in_(list(MATERIAL_NAMES.keys()))
+    F.data.startswith("opt_"),
+    GenerationStates.waiting_options
 )
-async def material_type_callback(
-    callback: CallbackQuery
+async def presentation_option(
+    callback: CallbackQuery,
+    state: FSMContext
 ):
+    data = await state.get_data()
+    options = data.get("options", {})
+
+    parts = callback.data.replace("opt_", "").split("_")
+
+    if len(parts) >= 2:
+        key = parts[0]
+        value = " ".join(parts[1:])
+
+        names = {
+            "images": "Изображения",
+            "tables": "Таблицы/схемы",
+            "notes": "Заметки докладчика"
+        }
+
+        values = {
+            "yes": "Да",
+            "no": "Нет"
+        }
+
+        options[names.get(key, key)] = values.get(
+            value,
+            value
+        )
+
+    await state.update_data(options=options)
+
+    await callback.answer("Сохранено")
+
+
+@dp.callback_query(
+    F.data.startswith("academic_"),
+    GenerationStates.waiting_options
+)
+async def academic_option(
+    callback: CallbackQuery,
+    state: FSMContext
+):
+    data = await state.get_data()
+    options = data.get("options", {})
+
+    names = {
+        "academic_toc": "Содержание",
+        "academic_refs": "Список литературы",
+        "academic_tables": "Таблицы",
+        "academic_schemes": "Схемы",
+        "academic_appendices": "Приложения"
+    }
+
+    key = names.get(callback.data)
+
+    if key:
+        options[key] = "Да"
+
+    await state.update_data(options=options)
+
+    await callback.answer(
+        f"{key}: Да"
+    )
+
+
+@dp.callback_query(
+    F.data == "options_continue",
+    GenerationStates.waiting_options
+)
+async def options_continue(
+    callback: CallbackQuery,
+    state: FSMContext
+):
+    await show_confirmation(
+        callback.message,
+        state
+    )
+    await callback.answer()
+
+
+@dp.callback_query(
+    F.data == "generation_edit",
+    GenerationStates.waiting_confirmation
+)
+async def generation_edit(
+    callback: CallbackQuery,
+    state: FSMContext
+):
+    await state.set_state(
+        GenerationStates.waiting_language
+    )
+
+    await callback.message.edit_text(
+        "🌐 Выберите язык материала:",
+        reply_markup=language_keyboard()
+    )
 
     await callback.answer()
 
-    material_type = MATERIAL_NAMES[
-        callback.data
+
+# ============================================================
+# DOCUMENT EXTRACTION
+# ============================================================
+
+def extract_document(path: Path, extension: str):
+    pages = []
+
+    if extension == ".pdf":
+        reader = PdfReader(str(path))
+
+        for number, page in enumerate(
+            reader.pages,
+            start=1
+        ):
+            try:
+                text = page.extract_text() or ""
+            except Exception:
+                text = ""
+
+            pages.append(
+                f"[BOOK_PAGE:{number}]\n{text}"
+            )
+
+        return "\n\n".join(pages), len(reader.pages)
+
+    if extension == ".docx":
+        doc = Document(str(path))
+
+        text = "\n".join(
+            paragraph.text
+            for paragraph in doc.paragraphs
+            if paragraph.text.strip()
+        )
+
+        return (
+            "[BOOK_PAGE:1]\n" + text,
+            1
+        )
+
+    if extension == ".txt":
+        text = path.read_text(
+            encoding="utf-8",
+            errors="ignore"
+        )
+
+        return (
+            "[BOOK_PAGE:1]\n" + text,
+            1
+        )
+
+    raise ValueError(
+        "Unsupported document type"
+    )
+
+
+# ============================================================
+# SOURCE PROCESSING
+# ============================================================
+
+def load_books(book_ids):
+    conn = db()
+
+    placeholders = ",".join(
+        "?" for _ in book_ids
+    )
+
+    rows = conn.execute(
+        f"""
+        SELECT *
+        FROM books
+        WHERE id IN ({placeholders})
+        ORDER BY id
+        """,
+        book_ids
+    ).fetchall()
+
+    conn.close()
+
+    return rows
+
+
+def split_pages(text):
+    pattern = r"\[BOOK_PAGE:(\d+)\]\n"
+    matches = list(re.finditer(pattern, text))
+
+    pages = []
+
+    for index, match in enumerate(matches):
+        page_number = int(match.group(1))
+
+        start = match.end()
+
+        if index + 1 < len(matches):
+            end = matches[index + 1].start()
+        else:
+            end = len(text)
+
+        page_text = text[start:end].strip()
+
+        pages.append(
+            (page_number, page_text)
+        )
+
+    return pages
+
+
+def build_source_context(books, topic, max_chars=110000):
+    """
+    Формирует контекст с указанием реальных страниц.
+    Старается включить информацию из всех выбранных книг.
+    """
+
+    topic_words = {
+        word.lower()
+        for word in re.findall(
+            r"[A-Za-zА-Яа-яІіЇїЄєҐґ]{4,}",
+            topic
+        )
+    }
+
+    blocks = []
+
+    # Сначала собираем совпадения по теме.
+    for book_index, book in enumerate(
+        books,
+        start=1
+    ):
+        pages = split_pages(
+            book["extracted_text"]
+        )
+
+        selected = []
+
+        for page_number, page_text in pages:
+            lower = page_text.lower()
+
+            score = sum(
+                1
+                for word in topic_words
+                if word in lower
+            )
+
+            if score > 0:
+                selected.append(
+                    (score, page_number, page_text)
+                )
+
+        selected.sort(
+            reverse=True,
+            key=lambda x: x[0]
+        )
+
+        # Берём наиболее релевантные страницы.
+        selected = selected[:25]
+
+        # Если совпадений нет — всё равно берём первые страницы.
+        if not selected:
+            selected = [
+                (0, page, text)
+                for page, text in pages[:8]
+            ]
+
+        blocks.append(
+            f"\n===== КНИГА {book_index} =====\n"
+            f"Название: {book['original_name']}\n"
+        )
+
+        for _, page_number, page_text in selected:
+            blocks.append(
+                f"\n[КНИГА {book_index}, СТРАНИЦА {page_number}]\n"
+                f"{page_text[:7000]}"
+            )
+
+    context = "\n".join(blocks)
+
+    return context[:max_chars]
+
+
+# ============================================================
+# GEMINI
+# ============================================================
+
+def language_name(code):
+    return {
+        "ru": "русском языке",
+        "uk": "украинском языке",
+        "en": "English"
+    }.get(code, "русском языке")
+
+
+async def ai_generate(
+    prompt: str,
+    model: Optional[str] = None
+):
+    if not gemini_client:
+        raise RuntimeError(
+            "GEMINI_API_KEY не настроен."
+        )
+
+    model = model or GEMINI_MODEL
+
+    def run():
+        return gemini_client.models.generate_content(
+            model=model,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=0.25
+            )
+        )
+
+    response = await asyncio.to_thread(run)
+
+    if not response or not response.text:
+        raise RuntimeError(
+            "AI вернул пустой ответ."
+        )
+
+    return response.text
+
+
+async def ask_ai_with_fallback(prompt):
+    models = [
+        GEMINI_MODEL,
+        GEMINI_FALLBACK_MODEL
     ]
 
-    telegram_id = callback.from_user.id
+    last_error = None
 
-    set_state(
-        telegram_id,
-        f"material:{material_type}"
+    for model in models:
+        for delay in [0, 4, 8]:
+            try:
+                if delay:
+                    await asyncio.sleep(delay)
+
+                return await ai_generate(
+                    prompt,
+                    model=model
+                )
+
+            except Exception as e:
+                last_error = e
+
+                logger.warning(
+                    "AI error model=%s: %s",
+                    model,
+                    e
+                )
+
+                error_text = str(e).lower()
+
+                temporary = any(
+                    word in error_text
+                    for word in [
+                        "429",
+                        "503",
+                        "quota",
+                        "rate",
+                        "unavailable",
+                        "timeout",
+                        "deadline"
+                    ]
+                )
+
+                if not temporary:
+                    break
+
+    raise RuntimeError(
+        f"AI generation failed: {last_error}"
     )
+
+
+# ============================================================
+# ACADEMIC PROMPT
+# ============================================================
+
+def base_source_rules():
+    return """
+КРИТИЧЕСКИЕ ПРАВИЛА:
+
+1. Используй ТОЛЬКО предоставленные источники.
+2. Не используй интернет.
+3. Не добавляй сведения из собственных знаний, если их нет
+   в предоставленных источниках.
+4. Не придумывай авторов, книги, издательства, годы,
+   страницы, статистику или факты.
+5. Если информации недостаточно, прямо напиши,
+   что в предоставленных источниках недостаточно данных.
+6. Для ссылок используй только реально существующие
+   номера книг и страницы из контекста.
+7. Формат ссылки:
+   [1, с. 25]
+   [2, с. 47]
+8. Никогда не создавай несуществующие страницы.
+9. Список литературы составляй только из реально
+   предоставленных книг.
+10. Если библиографических данных недостаточно,
+    не выдумывай отсутствующие данные.
+11. Не называй интернет-источники.
+12. Не ссылайся на Wikipedia или сайты.
+"""
+
+
+# ============================================================
+# OUTLINE
+# ============================================================
+
+async def generate_outline(
+    material_type,
+    topic,
+    volume,
+    language,
+    source_context,
+    options
+):
+    prompt = f"""
+Ты создаёшь академический материал.
+
+Тип: {material_type}
+Тема: {topic}
+Объём: {volume}
+Язык: {language_name(language)}
+
+{base_source_rules()}
+
+Создай подробный план материала.
+
+План должен соответствовать объёму.
+Для курсовой/дипломной используй логичную структуру
+с главами и подразделами.
+Для реферата — введение, основная часть, выводы.
+Для доклада — компактную структуру.
+Для презентации — структуру слайдов.
+
+Не пиши сам материал.
+Сначала создай только план.
+
+ИСТОЧНИКИ:
+
+{source_context}
+"""
+
+    return await ask_ai_with_fallback(prompt)
+
+
+# ============================================================
+# SECTION GENERATION
+# ============================================================
+
+async def generate_section(
+    material_type,
+    topic,
+    language,
+    section,
+    source_context,
+    target_length
+):
+    prompt = f"""
+Напиши один раздел академического материала.
+
+Тип материала: {material_type}
+Тема: {topic}
+Язык: {language_name(language)}
+Раздел: {section}
+Примерный объём раздела: {target_length}
+
+{base_source_rules()}
+
+Требования:
+
+• Пиши связным академическим текстом.
+• Не используй выдуманные факты.
+• Используй информацию из источников.
+• Если утверждение основано на источнике,
+  ставь ссылку вида [1, с. 15].
+• Страница должна реально присутствовать
+  среди предоставленных страниц.
+• Не придумывай страницы.
+• Не пиши список литературы в этом разделе.
+• Не добавляй информацию из интернета.
+
+ИСТОЧНИКИ:
+
+{source_context}
+"""
+
+    return await ask_ai_with_fallback(prompt)
+
+
+# ============================================================
+# PRESENTATION
+# ============================================================
+
+async def generate_slides(
+    topic,
+    language,
+    slide_count,
+    source_context,
+    options
+):
+    prompt = f"""
+Создай структуру презентации.
+
+Тема: {topic}
+Количество слайдов: {slide_count}
+Язык: {language_name(language)}
+
+{base_source_rules()}
+
+Верни строго JSON-массив.
+
+Каждый элемент должен иметь:
+
+{{
+  "title": "Название слайда",
+  "content": "Текст слайда",
+  "speaker_notes": "Заметки докладчика",
+  "image_hint": "Что можно показать из загруженного источника",
+  "references": ["[1, с. 20]"]
+}}
+
+Не используй Markdown.
+
+Каждый слайд должен быть информативным,
+но не перегруженным.
+
+ИСТОЧНИКИ:
+
+{source_context}
+"""
+
+    result = await ask_ai_with_fallback(prompt)
+
+    try:
+        clean = result.strip()
+
+        if clean.startswith("```"):
+            clean = re.sub(
+                r"^```(?:json)?",
+                "",
+                clean
+            )
+            clean = re.sub(
+                r"```$",
+                "",
+                clean
+            )
+
+        data = json.loads(clean)
+
+        if isinstance(data, list):
+            return data
+
+    except Exception:
+        pass
+
+    # Если модель вернула невалидный JSON,
+    # создаём один повторный запрос.
+    repair_prompt = f"""
+Преобразуй следующий ответ в корректный JSON.
+
+Нужен только JSON-массив без Markdown.
+
+Формат:
+
+[
+  {{
+    "title": "...",
+    "content": "...",
+    "speaker_notes": "...",
+    "image_hint": "...",
+    "references": []
+  }}
+]
+
+Ответ:
+
+{result}
+"""
+
+    repaired = await ask_ai_with_fallback(
+        repair_prompt
+    )
+
+    repaired = repaired.strip()
+
+    repaired = re.sub(
+        r"^```(?:json)?",
+        "",
+        repaired
+    )
+
+    repaired = re.sub(
+        r"```$",
+        "",
+        repaired
+    )
+
+    return json.loads(repaired)
+
+
+# ============================================================
+# REFERENCES
+# ============================================================
+
+async def generate_references(
+    books,
+    language
+):
+    source_lines = []
+
+    for index, book in enumerate(
+        books,
+        start=1
+    ):
+        source_lines.append(
+            f"{index}. {book['original_name']}"
+        )
+
+    prompt = f"""
+Составь список литературы только из следующих
+загруженных пользователем книг.
+
+{base_source_rules()}
+
+Не добавляй ни одной новой книги.
+
+Если в названии файла есть только название,
+используй его как название источника.
+
+Не выдумывай:
+автора,
+год,
+город,
+издательство,
+ISBN.
+
+Язык: {language_name(language)}
+
+Источники:
+
+{chr(10).join(source_lines)}
+"""
+
+    return await ask_ai_with_fallback(prompt)
+
+
+# ============================================================
+# DOCX
+# ============================================================
+
+def create_docx(
+    title,
+    topic,
+    sections,
+    references,
+    options,
+    output_path
+):
+    doc = Document()
+
+    title_paragraph = doc.add_paragraph()
+
+    run = title_paragraph.add_run(
+        title
+    )
+
+    run.bold = True
+    run.font.size = Pt(18)
+
+    topic_paragraph = doc.add_paragraph()
+    topic_paragraph.add_run(
+        f"Тема: {topic}"
+    ).bold = True
+
+    doc.add_paragraph()
+
+    for section_title, text in sections:
+        heading = doc.add_heading(
+            section_title,
+            level=1
+        )
+
+        for paragraph in re.split(
+            r"\n{2,}",
+            text
+        ):
+            if paragraph.strip():
+                doc.add_paragraph(
+                    paragraph.strip()
+                )
+
+    if references:
+        doc.add_heading(
+            "Список использованных источников",
+            level=1
+        )
+
+        for line in references.splitlines():
+            line = line.strip()
+
+            if line:
+                doc.add_paragraph(
+                    line,
+                    style="List Number"
+                )
+
+    doc.save(output_path)
+
+
+# ============================================================
+# PPTX
+# ============================================================
+
+def create_pptx(
+    topic,
+    slides,
+    output_path,
+    options
+):
+    prs = Presentation()
+
+    title_slide = prs.slides.add_slide(
+        prs.slide_layouts[0]
+    )
+
+    title_slide.shapes.title.text = topic
+
+    subtitle = title_slide.placeholders[1]
+
+    if subtitle:
+        subtitle.text = "Zolog AI"
+
+    for slide_data in slides:
+        slide = prs.slides.add_slide(
+            prs.slide_layouts[1]
+        )
+
+        slide.shapes.title.text = str(
+            slide_data.get("title", "")
+        )
+
+        body = slide.placeholders[1]
+
+        content = slide_data.get(
+            "content",
+            ""
+        )
+
+        references = slide_data.get(
+            "references",
+            []
+        )
+
+        if references:
+            content += "\n\n" + " ".join(
+                references
+            )
+
+        body.text = content
+
+        # Заметки докладчика
+        notes = slide_data.get(
+            "speaker_notes",
+            ""
+        )
+
+        if options.get(
+            "Заметки докладчика"
+        ) == "Да" and notes:
+
+            try:
+                notes_slide = slide.notes_slide
+
+                text_frame = (
+                    notes_slide.notes_text_frame
+                )
+
+                text_frame.text = notes
+
+            except Exception:
+                pass
+
+        # Изображения из интернета НЕ используются.
+        # image_hint оставляется как текстовая подсказка,
+        # чтобы не нарушать правило "только загруженные источники".
+
+        if options.get(
+            "Изображения"
+        ) == "Да":
+
+            hint = slide_data.get(
+                "image_hint",
+                ""
+            )
+
+            if hint:
+                textbox = slide.shapes.add_textbox(
+                    Inches(7.0),
+                    Inches(5.7),
+                    Inches(2.5),
+                    Inches(0.6)
+                )
+
+                textbox.text_frame.text = (
+                    "🖼 Иллюстрация из источника:\n"
+                    + hint
+                )
+
+    prs.save(output_path)
+
+
+# ============================================================
+# PROGRESS
+# ============================================================
+
+async def update_job(
+    job_id,
+    progress,
+    stage,
+    status="running"
+):
+    conn = db()
+
+    conn.execute("""
+        UPDATE jobs
+        SET progress = ?,
+            stage = ?,
+            status = ?,
+            updated_at = ?
+        WHERE id = ?
+    """, (
+        progress,
+        stage,
+        status,
+        datetime.now().isoformat(),
+        job_id
+    ))
+
+    conn.commit()
+    conn.close()
+
+
+async def progress_message(
+    message: Message,
+    text: str
+):
+    try:
+        await message.edit_text(text)
+    except Exception:
+        pass
+
+
+# ============================================================
+# GENERATION JOB
+# ============================================================
+
+async def run_generation(
+    message: Message,
+    state_data: dict,
+    material_id: int,
+    job_id: int
+):
+    user_id = message.from_user.id
+
+    try:
+        books = load_books(
+            state_data["books"]
+        )
+
+        await update_job(
+            job_id,
+            5,
+            "Обработка книг"
+        )
+
+        progress = await message.answer(
+            "🤖 Генерация началась.\n\n"
+            "▰░░░░░░░░░░ 5%\n"
+            "📚 Обрабатываю книги..."
+        )
+
+        await update_job(
+            job_id,
+            15,
+            "Книги обработаны"
+        )
+
+        await progress_message(
+            progress,
+            "🤖 Генерация материала\n\n"
+            "▰▰░░░░░░░░ 15%\n"
+            "📚 Книги обработаны.\n"
+            "🔎 Анализирую источники..."
+        )
+
+        source_context = build_source_context(
+            books,
+            state_data["topic"]
+        )
+
+        await update_job(
+            job_id,
+            25,
+            "Создание плана"
+        )
+
+        await progress_message(
+            progress,
+            "🤖 Генерация материала\n\n"
+            "▰▰▌░░░░░░░ 25%\n"
+            "🧠 Создаю структуру материала..."
+        )
+
+        material_type = state_data[
+            "material_type"
+        ]
+
+        language = state_data[
+            "language"
+        ]
+
+        topic = state_data[
+            "topic"
+        ]
+
+        volume = state_data[
+            "volume"
+        ]
+
+        options = state_data.get(
+            "options",
+            {}
+        )
+
+        # ====================================================
+        # PRESENTATION
+        # ====================================================
+
+        if material_type == "presentation":
+
+            slides = await generate_slides(
+                topic,
+                language,
+                volume,
+                source_context,
+                options
+            )
+
+            # Если AI вернул меньше слайдов,
+            # повторно не генерируем бесконечно.
+            slides = slides[:volume]
+
+            await update_job(
+                job_id,
+                70,
+                f"Создано слайдов: {len(slides)}"
+            )
+
+            await progress_message(
+                progress,
+                "🤖 Генерация презентации\n\n"
+                "▰▰▰▰▰▰▰░░░ 70%\n"
+                f"📊 Создано слайдов: {len(slides)}\n"
+                "🔍 Проверяю источники..."
+            )
+
+            references = await generate_references(
+                books,
+                language
+            )
+
+            await update_job(
+                job_id,
+                85,
+                "Создание PPTX"
+            )
+
+            await progress_message(
+                progress,
+                "🤖 Генерация презентации\n\n"
+                "▰▰▰▰▰▰▰▰▌░ 85%\n"
+                "📚 Формирую список источников..."
+            )
+
+            filename = (
+                f"presentation_{user_id}_"
+                f"{int(time.time())}.pptx"
+            )
+
+            output_path = OUTPUTS_DIR / filename
+
+            create_pptx(
+                topic,
+                slides,
+                output_path,
+                options
+            )
+
+            await update_job(
+                job_id,
+                97,
+                "Проверка готового файла"
+            )
+
+            await progress_message(
+                progress,
+                "🤖 Генерация презентации\n\n"
+                "▰▰▰▰▰▰▰▰▰▌ 97%\n"
+                "🔍 Финальная проверка..."
+            )
+
+            await asyncio.sleep(0.5)
+
+            await update_job(
+                job_id,
+                100,
+                "Готово",
+                status="completed"
+            )
+
+            conn = db()
+
+            conn.execute("""
+                UPDATE materials
+                SET status = 'completed',
+                    file_path = ?
+                WHERE id = ?
+            """, (
+                str(output_path),
+                material_id
+            ))
+
+            conn.commit()
+            conn.close()
+
+            await progress_message(
+                progress,
+                "✅ Презентация готова!\n\n"
+                f"📊 Слайдов: {len(slides)}"
+            )
+
+            await message.answer_document(
+                FSInputFile(output_path),
+                caption=(
+                    f"🎉 Ваша презентация готова!\n\n"
+                    f"📌 {topic}\n"
+                    f"📚 Использовано книг: {len(books)}"
+                )
+            )
+
+            return
+
+        # ====================================================
+        # DOCUMENT MATERIAL
+        # ====================================================
+
+        outline = await generate_outline(
+            material_type,
+            topic,
+            volume,
+            language,
+            source_context,
+            options
+        )
+
+        await update_job(
+            job_id,
+            35,
+            "План создан"
+        )
+
+        await progress_message(
+            progress,
+            "🤖 Генерация материала\n\n"
+            "▰▰▰▌░░░░░░ 35%\n"
+            "📑 План создан.\n"
+            "✍️ Начинаю написание разделов..."
+        )
+
+        # Извлекаем пункты плана.
+        raw_sections = []
+
+        for line in outline.splitlines():
+            clean = line.strip()
+
+            if not clean:
+                continue
+
+            clean = re.sub(
+                r"^[\d\.\)\-\–—•]+\s*",
+                "",
+                clean
+            )
+
+            if len(clean) >= 5:
+                raw_sections.append(clean)
+
+        # Ограничиваем количество секций.
+        raw_sections = raw_sections[:20]
+
+        if not raw_sections:
+            raw_sections = [
+                "Введение",
+                "Основная часть",
+                "Выводы"
+            ]
+
+        sections = []
+
+        total = len(raw_sections)
+
+        for index, section_title in enumerate(
+            raw_sections,
+            start=1
+        ):
+            progress_value = 35 + int(
+                45 * index / total
+            )
+
+            await update_job(
+                job_id,
+                progress_value,
+                f"Раздел {index}/{total}"
+            )
+
+            await progress_message(
+                progress,
+                "🤖 Генерация материала\n\n"
+                f"{'▰' * max(1, progress_value // 10)}"
+                f"{'░' * max(0, 10 - progress_value // 10)} "
+                f"{progress_value}%\n"
+                f"✍️ Раздел {index}/{total}\n"
+                f"📑 {section_title}"
+            )
+
+            target_length = max(
+                700,
+                int(
+                    volume * 1000 / total
+                )
+            )
+
+            section_text = await generate_section(
+                material_type,
+                topic,
+                language,
+                section_title,
+                source_context,
+                target_length
+            )
+
+            sections.append(
+                (
+                    section_title,
+                    section_text
+                )
+            )
+
+        await update_job(
+            job_id,
+            82,
+            "Формирование источников"
+        )
+
+        await progress_message(
+            progress,
+            "🤖 Генерация материала\n\n"
+            "▰▰▰▰▰▰▰▰▏░ 82%\n"
+            "📚 Формирую список литературы..."
+        )
+
+        references = await generate_references(
+            books,
+            language
+        )
+
+        await update_job(
+            job_id,
+            90,
+            "Создание DOCX"
+        )
+
+        await progress_message(
+            progress,
+            "🤖 Генерация материала\n\n"
+            "▰▰▰▰▰▰▰▰▰░ 90%\n"
+            "📄 Создаю DOCX..."
+        )
+
+        filename = (
+            f"material_{user_id}_"
+            f"{int(time.time())}.docx"
+        )
+
+        output_path = OUTPUTS_DIR / filename
+
+        create_docx(
+            title=material_type.upper(),
+            topic=topic,
+            sections=sections,
+            references=references,
+            options=options,
+            output_path=output_path
+        )
+
+        await update_job(
+            job_id,
+            97,
+            "Финальная проверка"
+        )
+
+        await progress_message(
+            progress,
+            "🤖 Генерация материала\n\n"
+            "▰▰▰▰▰▰▰▰▰▌ 97%\n"
+            "🔍 Проверяю готовый файл..."
+        )
+
+        await asyncio.sleep(0.5)
+
+        conn = db()
+
+        conn.execute("""
+            UPDATE materials
+            SET status = 'completed',
+                file_path = ?
+            WHERE id = ?
+        """, (
+            str(output_path),
+            material_id
+        ))
+
+        conn.commit()
+        conn.close()
+
+        await update_job(
+            job_id,
+            100,
+            "Готово",
+            status="completed"
+        )
+
+        await progress_message(
+            progress,
+            "✅ Материал полностью готов!"
+        )
+
+        await message.answer_document(
+            FSInputFile(output_path),
+            caption=(
+                "🎉 Материал готов!\n\n"
+                f"📌 {topic}\n"
+                f"📚 Использовано книг: {len(books)}\n"
+                "📄 Формат: DOCX"
+            )
+        )
+
+    except Exception as e:
+        logger.exception(
+            "Generation job error: %s",
+            e
+        )
+
+        await update_job(
+            job_id,
+            0,
+            "Ошибка",
+            status="error"
+        )
+
+        conn = db()
+
+        conn.execute("""
+            UPDATE materials
+            SET status = 'error'
+            WHERE id = ?
+        """, (material_id,))
+
+        conn.execute("""
+            UPDATE jobs
+            SET error = ?
+            WHERE id = ?
+        """, (
+            str(e)[:2000],
+            job_id
+        ))
+
+        conn.commit()
+        conn.close()
+
+        # Возвращаем генерацию при ошибке.
+        add_generations(
+            user_id,
+            1
+        )
+
+        await message.answer(
+            "❌ Во время генерации произошла ошибка.\n\n"
+            "Генерация возвращена на баланс.\n\n"
+            "Попробуйте ещё раз."
+        )
+
+
+# ============================================================
+# START GENERATION
+# ============================================================
+
+@dp.callback_query(
+    F.data == "generation_start",
+    GenerationStates.waiting_confirmation
+)
+async def generation_start(
+    callback: CallbackQuery,
+    state: FSMContext
+):
+    user_id = callback.from_user.id
+
+    if get_generations(user_id) <= 0:
+        await callback.answer(
+            "❌ У вас нет генераций.",
+            show_alert=True
+        )
+        return
+
+    # Списываем только здесь.
+    if not spend_generation(user_id):
+        await callback.answer(
+            "❌ Не удалось списать генерацию.",
+            show_alert=True
+        )
+        return
+
+    data = await state.get_data()
+
+    now = datetime.now().isoformat()
+
+    conn = db()
+
+    cur = conn.execute("""
+        INSERT INTO materials
+        (
+            telegram_id,
+            material_type,
+            topic,
+            language,
+            volume,
+            volume_type,
+            options,
+            status,
+            created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'generating', ?)
+    """, (
+        user_id,
+        data["material_type"],
+        data["topic"],
+        data["language"],
+        data["volume"],
+        data["volume_type"],
+        json.dumps(
+            data.get("options", {}),
+            ensure_ascii=False
+        ),
+        now
+    ))
+
+    material_id = cur.lastrowid
+
+    cur = conn.execute("""
+        INSERT INTO jobs
+        (
+            telegram_id,
+            material_id,
+            status,
+            progress,
+            stage,
+            created_at,
+            updated_at
+        )
+        VALUES (?, ?, 'running', 0, ?, ?, ?)
+    """, (
+        user_id,
+        material_id,
+        "Запуск",
+        now,
+        now
+    ))
+
+    job_id = cur.lastrowid
+
+    conn.commit()
+    conn.close()
+
+    await state.clear()
 
     await callback.message.edit_text(
-        f"📝 Вы выбрали: <b>{material_type}</b>\n\n"
-        "Теперь отправьте мне тему.\n\n"
-        "Например:\n"
-        "<i>Физическая терапия после инсульта</i>",
-        parse_mode="HTML"
+        "🚀 Запускаю генерацию...\n\n"
+        "Генерация списана.\n"
+        "Можете закрыть Telegram — бот продолжит работу."
     )
-
-
-@dp.callback_query(F.data == "material_custom")
-async def material_custom_callback(
-    callback: CallbackQuery
-):
 
     await callback.answer()
 
-    set_state(
-        callback.from_user.id,
-        "material:Свой запрос"
-    )
-
-    await callback.message.edit_text(
-        "🧠 <b>Свой запрос</b>\n\n"
-        "Напишите подробно, что должен создать Zolog AI.",
-        parse_mode="HTML"
+    # Фоновая задача.
+    asyncio.create_task(
+        run_generation(
+            callback.message,
+            data,
+            material_id,
+            job_id
+        )
     )
 
 
@@ -1192,702 +2681,293 @@ async def material_custom_callback(
 # ============================================================
 
 @dp.callback_query(F.data == "ask_ai")
-async def ask_ai_callback(
-    callback: CallbackQuery
+async def ask_ai_start(
+    callback: CallbackQuery,
+    state: FSMContext
 ):
-
-    await callback.answer()
-
-    set_state(
-        callback.from_user.id,
-        "ask_ai"
+    await state.clear()
+    await state.set_state(
+        AskStates.waiting_question
     )
 
     await callback.message.edit_text(
-        "🧠 <b>Задайте вопрос AI</b>\n\n"
-        "Напишите свой вопрос следующим сообщением.",
-        parse_mode="HTML"
+        "🧠 Спросить AI\n\n"
+        "Напишите свой вопрос.\n\n"
+        "AI сможет отвечать на основе "
+        "загруженных вами книг.",
+        reply_markup=back_menu()
     )
-
-
-# ============================================================
-# MESSAGE PROCESSOR
-# ============================================================
-
-@dp.message(F.text)
-async def text_handler(message: Message):
-
-    telegram_id = message.from_user.id
-
-    if user_is_blocked(telegram_id):
-
-        await message.answer(
-            "🚫 Ваш аккаунт заблокирован."
-        )
-
-        return
-
-    create_user(message)
-
-    state = get_state(telegram_id)
-
-    if not state:
-
-        await message.answer(
-            "Выберите действие в меню:",
-            reply_markup=main_menu()
-        )
-
-        return
-
-    # --------------------------------------------
-    # ASK AI
-    # --------------------------------------------
-
-    if state == "ask_ai":
-
-        if not remove_generation(
-            telegram_id
-        ):
-
-            await message.answer(
-                "❌ У вас закончились генерации.\n\n"
-                "Получить новые можно через "
-                "⭐ «Получить генерации»."
-            )
-
-            clear_state(telegram_id)
-
-            return
-
-        prompt = (
-            "Ты — AI-помощник Zolog AI.\n"
-            "Отвечай понятно, подробно и по существу.\n"
-            "Если вопрос учебный — объясняй структурировано.\n\n"
-            f"Вопрос пользователя:\n{message.text}"
-        )
-
-        await message.answer(
-            "🤖 Думаю над ответом..."
-        )
-
-        result = await ask_ai(prompt)
-
-        if result is None:
-
-            add_generations(
-                telegram_id,
-                1
-            )
-
-            await message.answer(
-                "⚠️ Сейчас AI временно недоступен.\n\n"
-                "Генерация возвращена на баланс."
-            )
-
-        else:
-
-            await message.answer(
-                result
-            )
-
-        log_action(
-            telegram_id,
-            "ask_ai",
-            message.text[:500]
-        )
-
-        clear_state(telegram_id)
-
-        return
-
-    # --------------------------------------------
-    # MATERIAL
-    # --------------------------------------------
-
-    if state.startswith("material:"):
-
-        material_type = state.split(
-            ":",
-            1
-        )[1]
-
-        topic = message.text.strip()
-
-        if not remove_generation(
-            telegram_id
-        ):
-
-            await message.answer(
-                "❌ У вас закончились генерации.\n\n"
-                "Получите новые генерации через меню."
-            )
-
-            clear_state(telegram_id)
-
-            return
-
-        await message.answer(
-            "🤖 Начинаю подготовку материала...\n\n"
-            "Это может занять некоторое время."
-        )
-
-        prompt = f"""
-Ты — профессиональный AI-сервис Zolog AI.
-
-Создай учебный материал.
-
-Тип:
-{material_type}
-
-Тема:
-{topic}
-
-Требования:
-- писать на русском языке;
-- структурировать материал;
-- использовать заголовки;
-- раскрыть тему содержательно;
-- не выдумывать конкретные источники;
-- если это учебная работа, добавить введение,
-  основную часть и выводы;
-- текст должен быть пригоден для дальнейшего
-  редактирования и оформления.
-
-Материал:
-"""
-
-        result = await ask_ai(prompt)
-
-        if result is None:
-
-            add_generations(
-                telegram_id,
-                1
-            )
-
-            await message.answer(
-                "⚠️ Не удалось получить материал.\n\n"
-                "Генерация возвращена."
-            )
-
-        else:
-
-            title = topic[:200]
-
-            db.execute(
-                """
-                INSERT INTO materials
-                (
-                    telegram_id,
-                    material_type,
-                    title,
-                    content,
-                    created_at
-                )
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (
-                    telegram_id,
-                    material_type,
-                    title,
-                    result,
-                    now()
-                )
-            )
-
-            db.commit()
-
-            await message.answer(
-                "✅ <b>Материал готов!</b>\n\n"
-                f"<b>{html.escape(topic)}</b>\n\n"
-                f"{result}",
-                parse_mode="HTML"
-            )
-
-            log_action(
-                telegram_id,
-                "material_created",
-                material_type
-            )
-
-        clear_state(telegram_id)
-
-        return
-
-
-# ============================================================
-# BOOK UPLOAD
-# ============================================================
-
-@dp.callback_query(F.data == "upload_book")
-async def upload_book_callback(
-    callback: CallbackQuery
-):
 
     await callback.answer()
 
-    set_state(
-        callback.from_user.id,
-        "upload_book"
-    )
 
-    await callback.message.edit_text(
-        "📖 <b>Загрузка книги</b>\n\n"
-        "Отправьте PDF, DOCX или TXT-файл.\n\n"
-        "После загрузки книга появится в вашей "
-        "личной библиотеке.",
-        parse_mode="HTML"
-    )
-
-
-@dp.message(F.document)
-async def document_handler(message: Message):
-
-    telegram_id = message.from_user.id
-
-    create_user(message)
-
-    state = get_state(telegram_id)
-
-    if state != "upload_book":
-
-        await message.answer(
-            "📖 Если хотите добавить этот файл "
-            "в библиотеку, сначала нажмите "
-            "«📖 Загрузить книгу»."
-        )
-
-        return
-
-    document = message.document
-
-    filename = document.file_name or "file"
-
-    extension = (
-        Path(filename)
-        .suffix
-        .lower()
-    )
-
-    allowed = [
-        ".pdf",
-        ".docx",
-        ".txt"
-    ]
-
-    if extension not in allowed:
-
-        await message.answer(
-            "❌ Поддерживаются только:\n"
-            "PDF, DOCX и TXT."
-        )
-
-        return
-
-    await message.answer(
-        "📥 Загружаю и анализирую файл..."
-    )
-
-    user_dir = FILES_DIR / str(
-        telegram_id
-    )
-
-    user_dir.mkdir(
-        parents=True,
-        exist_ok=True
-    )
-
-    safe_filename = (
-        f"{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        f"_{filename}"
-    )
-
-    file_path = user_dir / safe_filename
-
-    try:
-
-        telegram_file = await bot.get_file(
-            document.file_id
-        )
-
-        await bot.download_file(
-            telegram_file.file_path,
-            destination=file_path
-        )
-
-        extracted_text = ""
-
-        # --------------------------------------------
-        # PDF
-        # --------------------------------------------
-
-        if extension == ".pdf":
-
-            reader = PdfReader(
-                str(file_path)
-            )
-
-            pages = []
-
-            for page in reader.pages:
-
-                try:
-                    text = page.extract_text()
-
-                    if text:
-                        pages.append(text)
-
-                except Exception:
-                    continue
-
-            extracted_text = "\n".join(
-                pages
-            )
-
-        # --------------------------------------------
-        # DOCX
-        # --------------------------------------------
-
-        elif extension == ".docx":
-
-            doc = Document(
-                str(file_path)
-            )
-
-            extracted_text = "\n".join(
-                paragraph.text
-                for paragraph in doc.paragraphs
-                if paragraph.text.strip()
-            )
-
-        # --------------------------------------------
-        # TXT
-        # --------------------------------------------
-
-        elif extension == ".txt":
-
-            extracted_text = file_path.read_text(
-                encoding="utf-8",
-                errors="ignore"
-            )
-
-        db.execute(
-            """
-            INSERT INTO books
-            (
-                telegram_id,
-                filename,
-                file_path,
-                extracted_text,
-                created_at
-            )
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (
-                telegram_id,
-                filename,
-                str(file_path),
-                extracted_text,
-                now()
-            )
-        )
-
-        db.commit()
-
-        clear_state(telegram_id)
-
-        log_action(
-            telegram_id,
-            "book_uploaded",
-            filename
-        )
-
-        await message.answer(
-            "✅ <b>Книга добавлена!</b>\n\n"
-            f"📖 {html.escape(filename)}\n"
-            f"📄 Символов извлечено: "
-            f"<b>{len(extracted_text)}</b>\n\n"
-            "Теперь она доступна в "
-            "«📚 Моей библиотеке».",
-            parse_mode="HTML",
-            reply_markup=main_menu()
-        )
-
-    except Exception as e:
-
-        logger.exception(
-            "Ошибка обработки книги"
-        )
-
-        await message.answer(
-            "❌ Не удалось обработать файл.\n\n"
-            f"Ошибка: {str(e)[:500]}"
-        )
-
-
-# ============================================================
-# LIBRARY
-# ============================================================
-
-@dp.callback_query(F.data == "library")
-async def library_callback(
-    callback: CallbackQuery
+@dp.message(AskStates.waiting_question, F.text)
+async def ask_ai_question(
+    message: Message,
+    state: FSMContext
 ):
+    question = message.text.strip()
 
-    await callback.answer()
+    if not question:
+        return
 
-    telegram_id = callback.from_user.id
+    conn = db()
 
-    books = db.execute(
-        """
+    books = conn.execute("""
         SELECT *
         FROM books
         WHERE telegram_id = ?
         ORDER BY id DESC
         LIMIT 10
-        """,
-        (telegram_id,)
-    ).fetchall()
+    """, (
+        message.from_user.id,
+    )).fetchall()
 
-    materials = db.execute(
-        """
+    conn.close()
+
+    if not books:
+        await message.answer(
+            "📚 У вас пока нет загруженных книг.\n\n"
+            "Сначала загрузите книгу через "
+            "«📝 Создать материал»."
+        )
+
+        await state.clear()
+        return
+
+    context = build_source_context(
+        books,
+        question
+    )
+
+    prompt = f"""
+Ответь на вопрос пользователя.
+
+ВОПРОС:
+{question}
+
+{base_source_rules()}
+
+Отвечай только на основании источников ниже.
+
+ИСТОЧНИКИ:
+
+{context}
+"""
+
+    await message.answer(
+        "🧠 Анализирую загруженные источники..."
+    )
+
+    try:
+        answer = await ask_ai_with_fallback(
+            prompt
+        )
+
+        # Telegram limit.
+        if len(answer) <= 4000:
+            await message.answer(answer)
+        else:
+            path = OUTPUTS_DIR / (
+                f"answer_{message.from_user.id}_"
+                f"{int(time.time())}.txt"
+            )
+
+            path.write_text(
+                answer,
+                encoding="utf-8"
+            )
+
+            await message.answer_document(
+                FSInputFile(path),
+                caption="🧠 Ответ AI"
+            )
+
+    except Exception:
+        await message.answer(
+            "❌ Не удалось получить ответ от AI."
+        )
+
+    await state.clear()
+
+
+# ============================================================
+# BOOKS
+# ============================================================
+
+@dp.callback_query(F.data == "my_books")
+async def my_books(callback: CallbackQuery):
+    conn = db()
+
+    books = conn.execute("""
+        SELECT *
+        FROM books
+        WHERE telegram_id = ?
+        ORDER BY id DESC
+        LIMIT 20
+    """, (
+        callback.from_user.id,
+    )).fetchall()
+
+    conn.close()
+
+    if not books:
+        text = (
+            "📖 Ваша библиотека пуста.\n\n"
+            "Добавьте книги через "
+            "«📝 Создать материал»."
+        )
+
+    else:
+        lines = [
+            "📖 ВАША БИБЛИОТЕКА\n"
+        ]
+
+        for book in books:
+            lines.append(
+                f"#{book['id']} — "
+                f"{book['original_name']} "
+                f"({book['pages']} стр.)"
+            )
+
+        text = "\n".join(lines)
+
+    await callback.message.edit_text(
+        text,
+        reply_markup=back_menu()
+    )
+
+    await callback.answer()
+
+
+# ============================================================
+# MATERIALS
+# ============================================================
+
+@dp.callback_query(F.data == "my_materials")
+async def my_materials(callback: CallbackQuery):
+    conn = db()
+
+    materials = conn.execute("""
         SELECT *
         FROM materials
         WHERE telegram_id = ?
         ORDER BY id DESC
-        LIMIT 10
-        """,
-        (telegram_id,)
-    ).fetchall()
+        LIMIT 20
+    """, (
+        callback.from_user.id,
+    )).fetchall()
 
-    text = "📚 <b>Моя библиотека</b>\n\n"
+    conn.close()
 
-    text += "📖 <b>Книги:</b>\n"
-
-    if books:
-
-        for book in books:
-
-            text += (
-                f"• {html.escape(book['filename'])}\n"
-            )
+    if not materials:
+        text = "📚 У вас пока нет созданных материалов."
 
     else:
-
-        text += "Пока нет загруженных книг.\n"
-
-    text += "\n📝 <b>Материалы:</b>\n"
-
-    if materials:
+        lines = [
+            "📚 МОИ МАТЕРИАЛЫ\n"
+        ]
 
         for material in materials:
-
-            text += (
-                f"• {html.escape(material['title'])} "
-                f"— {html.escape(material['material_type'])}\n"
+            status = {
+                "generating": "⏳ Генерируется",
+                "completed": "✅ Готов",
+                "error": "❌ Ошибка"
+            }.get(
+                material["status"],
+                material["status"]
             )
 
-    else:
+            lines.append(
+                f"#{material['id']} — "
+                f"{material['topic']}\n"
+                f"{status}"
+            )
 
-        text += "Пока нет созданных материалов.\n"
+        text = "\n\n".join(lines)
 
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="◀️ Назад",
-                    callback_data="back_main"
-                )
-            ]
-        ]
+    await callback.message.edit_text(
+        text,
+        reply_markup=back_menu()
+    )
+
+    await callback.answer()
+
+
+# ============================================================
+# PROFILE
+# ============================================================
+
+@dp.callback_query(F.data == "profile")
+async def profile(callback: CallbackQuery):
+    user = get_user(
+        callback.from_user.id
+    )
+
+    conn = db()
+
+    books = conn.execute(
+        "SELECT COUNT(*) FROM books WHERE telegram_id = ?",
+        (callback.from_user.id,)
+    ).fetchone()[0]
+
+    materials = conn.execute(
+        "SELECT COUNT(*) FROM materials WHERE telegram_id = ?",
+        (callback.from_user.id,)
+    ).fetchone()[0]
+
+    referrals = conn.execute(
+        "SELECT COUNT(*) FROM referrals WHERE inviter_id = ?",
+        (callback.from_user.id,)
+    ).fetchone()[0]
+
+    conn.close()
+
+    text = (
+        "👤 ПРОФИЛЬ\n\n"
+        f"🆔 ID: {callback.from_user.id}\n"
+        f"👤 Имя: {callback.from_user.first_name}\n"
+        f"⭐ Генераций: {user['generations']}\n"
+        f"📖 Книг: {books}\n"
+        f"📚 Материалов: {materials}\n"
+        f"🎁 Приглашено друзей: {referrals}"
     )
 
     await callback.message.edit_text(
         text,
-        reply_markup=keyboard,
-        parse_mode="HTML"
+        reply_markup=back_menu()
     )
-
-
-# ============================================================
-# PROFILE CALLBACK
-# ============================================================
-
-@dp.callback_query(F.data == "profile")
-async def profile_callback(
-    callback: CallbackQuery
-):
 
     await callback.answer()
 
-    await show_profile(
-        callback.from_user.id,
-        callback
-    )
-
 
 # ============================================================
-# REFERRAL CALLBACK
+# REFERRAL
 # ============================================================
 
 @dp.callback_query(F.data == "referral")
-async def referral_callback(
-    callback: CallbackQuery
-):
+async def referral(callback: CallbackQuery):
+    me = await bot.get_me()
 
-    await callback.answer()
-
-    await show_referral(
-        callback.from_user.id,
-        callback
-    )
-
-
-# ============================================================
-# LANGUAGE
-# ============================================================
-
-@dp.callback_query(F.data == "language")
-async def language_callback(
-    callback: CallbackQuery
-):
-
-    await callback.answer()
-
-    await callback.message.edit_text(
-        "🌐 <b>Выберите язык:</b>",
-        reply_markup=language_menu(),
-        parse_mode="HTML"
-    )
-
-
-@dp.callback_query(
-    F.data.in_(
-        [
-            "lang_uk",
-            "lang_ru",
-            "lang_en"
-        ]
-    )
-)
-async def language_change(
-    callback: CallbackQuery
-):
-
-    languages = {
-        "lang_uk": "uk",
-        "lang_ru": "ru",
-        "lang_en": "en"
-    }
-
-    language = languages[
-        callback.data
-    ]
-
-    db.execute(
-        """
-        UPDATE users
-        SET language = ?
-        WHERE telegram_id = ?
-        """,
-        (
-            language,
-            callback.from_user.id
-        )
-    )
-
-    db.commit()
-
-    await callback.answer(
-        "Язык сохранён!"
+    link = (
+        f"https://t.me/{me.username}"
+        f"?start=ref_{callback.from_user.id}"
     )
 
     await callback.message.edit_text(
-        "✅ Язык успешно изменён.",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="◀️ Главное меню",
-                        callback_data="back_main"
-                    )
-                ]
-            ]
-        )
+        "🎁 ПРИГЛАСИТЬ ДРУГА\n\n"
+        f"За каждого нового пользователя вы получите "
+        f"+{REFERRAL_REWARD} генерацию.\n\n"
+        "Ваша ссылка:\n"
+        f"{link}",
+        reply_markup=back_menu()
     )
-
-
-# ============================================================
-# SETTINGS
-# ============================================================
-
-@dp.callback_query(F.data == "settings")
-async def settings_callback(
-    callback: CallbackQuery
-):
 
     await callback.answer()
 
-    await callback.message.edit_text(
-        "⚙️ <b>Настройки</b>\n\n"
-        "Здесь будут доступны настройки "
-        "Zolog AI.\n\n"
-        "Раздел подготовлен для дальнейшего "
-        "расширения.",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="◀️ Назад",
-                        callback_data="back_main"
-                    )
-                ]
-            ]
-        ),
-        parse_mode="HTML"
-    )
-
 
 # ============================================================
-# HELP
-# ============================================================
-
-@dp.callback_query(F.data == "help")
-async def help_callback(
-    callback: CallbackQuery
-):
-
-    await callback.answer()
-
-    await callback.message.edit_text(
-        "ℹ️ <b>Помощь Zolog AI</b>\n\n"
-        "📝 Создать материал — создание "
-        "рефератов, курсовых, конспектов и т.д.\n\n"
-        "🧠 Спросить AI — задать обычный вопрос.\n\n"
-        "📖 Загрузить книгу — добавить PDF, DOCX "
-        "или TXT в библиотеку.\n\n"
-        "📚 Библиотека — ваши книги и материалы.\n\n"
-        "🎁 Пригласить друга — получить генерации "
-        "за приглашённых пользователей.\n\n"
-        "⭐ Получить генерации — купить генерации "
-        "за Telegram Stars.",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="◀️ Назад",
-                        callback_data="back_main"
-                    )
-                ]
-            ]
-        ),
-        parse_mode="HTML"
-    )
-
-
-# ============================================================
-# PAYMENTS
+# BUY GENERATIONS
 # ============================================================
 
 PACKAGES = {
@@ -1910,173 +2990,129 @@ PACKAGES = {
 
 
 @dp.callback_query(F.data == "buy_generations")
-async def buy_generations_callback(
-    callback: CallbackQuery
-):
-
-    await callback.answer()
+async def buy_generations(callback: CallbackQuery):
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="⭐ BASIC — 50 ⭐ → 100 генераций",
+                    callback_data="buy_basic"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⭐ PRO — 150 ⭐ → 500 генераций",
+                    callback_data="buy_pro"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⭐ PREMIUM — 350 ⭐ → 1500 генераций",
+                    callback_data="buy_premium"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ Назад",
+                    callback_data="main_menu"
+                )
+            ]
+        ]
+    )
 
     await callback.message.edit_text(
-        "⭐ <b>Получить генерации</b>\n\n"
+        "⭐ ПОЛУЧИТЬ ГЕНЕРАЦИИ\n\n"
         "Выберите пакет:",
-        reply_markup=payment_menu(),
-        parse_mode="HTML"
+        reply_markup=keyboard
     )
-
-
-async def send_package_invoice(
-    telegram_id: int,
-    package_key: str
-):
-
-    package = PACKAGES[
-        package_key
-    ]
-
-    payload = (
-        f"zolog_{package_key}_"
-        f"{telegram_id}_"
-        f"{datetime.now().timestamp()}"
-    )
-
-    await bot.send_invoice(
-        chat_id=telegram_id,
-        title=f"Zolog AI — {package['name']}",
-        description=(
-            f"{package['generations']} "
-            "генераций Zolog AI"
-        ),
-        payload=payload,
-        currency="XTR",
-        prices=[
-            LabeledPrice(
-                label=f"{package['generations']} генераций",
-                amount=package["stars"]
-            )
-        ]
-    )
-
-
-@dp.callback_query(
-    F.data.in_(
-        [
-            "buy_basic",
-            "buy_pro",
-            "buy_premium"
-        ]
-    )
-)
-async def package_callback(
-    callback: CallbackQuery
-):
 
     await callback.answer()
 
-    mapping = {
-        "buy_basic": "basic",
-        "buy_pro": "pro",
-        "buy_premium": "premium"
-    }
 
-    package_key = mapping[
-        callback.data
+@dp.callback_query(F.data.startswith("buy_"))
+async def create_invoice(callback: CallbackQuery):
+    package_id = callback.data.replace(
+        "buy_",
+        ""
+    )
+
+    package = PACKAGES.get(package_id)
+
+    if not package:
+        await callback.answer(
+            "Пакет не найден.",
+            show_alert=True
+        )
+        return
+
+    prices = [
+        LabeledPrice(
+            label=package["name"],
+            amount=package["stars"]
+        )
     ]
 
-    try:
+    await bot.send_invoice(
+        chat_id=callback.from_user.id,
+        title=f"Zolog AI — {package['name']}",
+        description=(
+            f"{package['generations']} генераций"
+        ),
+        payload=f"zolog_{package_id}",
+        currency="XTR",
+        prices=prices
+    )
 
-        await send_package_invoice(
-            callback.from_user.id,
-            package_key
-        )
+    await callback.answer()
 
-    except Exception as e:
-
-        logger.exception(
-            "Ошибка создания платежа"
-        )
-
-        await callback.message.answer(
-            "❌ Не удалось создать платёж.\n\n"
-            f"{str(e)[:500]}"
-        )
-
-
-# ============================================================
-# PRE-CHECKOUT
-# ============================================================
 
 @dp.pre_checkout_query()
-async def pre_checkout_handler(
+async def pre_checkout(
     query: PreCheckoutQuery
 ):
-
     await query.answer(
         ok=True
     )
 
 
-# ============================================================
-# SUCCESSFUL PAYMENT
-# ============================================================
-
-@dp.message(
-    F.successful_payment
-)
-async def successful_payment_handler(
+@dp.message(F.successful_payment)
+async def successful_payment(
     message: Message
 ):
-
     payment = message.successful_payment
-
-    telegram_id = message.from_user.id
 
     charge_id = (
         payment.telegram_payment_charge_id
     )
 
-    # Защита от повторного начисления
-    existing = db.execute(
-        """
+    conn = db()
+
+    existing = conn.execute("""
         SELECT id
         FROM payments
         WHERE telegram_charge_id = ?
-        """,
-        (charge_id,)
-    ).fetchone()
+    """, (
+        charge_id,
+    )).fetchone()
 
     if existing:
-
-        await message.answer(
-            "⚠️ Этот платёж уже был обработан."
-        )
-
+        conn.close()
         return
 
-    package_key = None
+    payload = payment.invoice_payload
 
-    for key, package in PACKAGES.items():
+    package_id = payload.replace(
+        "zolog_",
+        ""
+    )
 
-        if package["stars"] == payment.total_amount:
+    package = PACKAGES.get(package_id)
 
-            package_key = key
-            break
-
-    if package_key is None:
-
-        await message.answer(
-            "⚠️ Платёж получен, "
-            "но пакет не удалось определить.\n"
-            "Обратитесь к администратору."
-        )
-
+    if not package:
+        conn.close()
         return
 
-    package = PACKAGES[
-        package_key
-    ]
-
-    db.execute(
-        """
+    conn.execute("""
         INSERT INTO payments
         (
             telegram_id,
@@ -2087,725 +3123,1650 @@ async def successful_payment_handler(
             created_at
         )
         VALUES (?, ?, ?, ?, ?, ?)
-        """,
-        (
-            telegram_id,
-            package["name"],
-            package["stars"],
-            package["generations"],
-            charge_id,
-            now()
-        )
-    )
+    """, (
+        message.from_user.id,
+        package_id,
+        payment.total_amount,
+        package["generations"],
+        charge_id,
+        datetime.now().isoformat()
+    ))
 
-    db.commit()
+    conn.commit()
+    conn.close()
 
     add_generations(
-        telegram_id,
+        message.from_user.id,
         package["generations"]
     )
 
-    log_action(
-        telegram_id,
-        "payment",
-        f"{package['name']} +{package['generations']}"
+    await message.answer(
+        "🎉 Оплата успешно получена!\n\n"
+        f"⭐ Пакет: {package['name']}\n"
+        f"➕ Начислено: {package['generations']} генераций\n"
+        f"⭐ Потрачено: {payment.total_amount} Stars\n\n"
+        f"Ваш баланс: "
+        f"{get_generations(message.from_user.id)}"
     )
 
-    user = get_user(
-        telegram_id
+
+# ============================================================
+# LANGUAGE
+# ============================================================
+
+@dp.callback_query(F.data == "language")
+async def language_settings(callback: CallbackQuery):
+    await callback.message.edit_text(
+        "🌐 Выберите язык интерфейса:",
+        reply_markup=language_keyboard()
     )
+
+    await callback.answer()
+
+
+@dp.callback_query(
+    F.data.in_({
+        "gen_lang_ru",
+        "gen_lang_uk",
+        "gen_lang_en"
+    })
+)
+async def save_language(callback: CallbackQuery):
+    lang = callback.data.replace(
+        "gen_lang_",
+        ""
+    )
+
+    conn = db()
+
+    conn.execute("""
+        UPDATE users
+        SET language = ?
+        WHERE telegram_id = ?
+    """, (
+        lang,
+        callback.from_user.id
+    ))
+
+    conn.commit()
+    conn.close()
+
+    await callback.answer(
+        "Язык сохранён."
+    )
+
+    await callback.message.edit_text(
+        "🌐 Язык сохранён.",
+        reply_markup=back_menu()
+    )
+
+
+# ============================================================
+# SETTINGS
+# ============================================================
+
+@dp.callback_query(F.data == "settings")
+async def settings(callback: CallbackQuery):
+    await callback.message.edit_text(
+        "⚙️ НАСТРОЙКИ\n\n"
+        "Основные настройки доступны "
+        "через профиль и выбор языка.\n\n"
+        "Расширенные параметры находятся "
+        "в панели администратора.",
+        reply_markup=back_menu()
+    )
+
+    await callback.answer()
+
+
+# ============================================================
+# HELP
+# ============================================================
+
+@dp.callback_query(F.data == "help")
+async def help_callback(callback: CallbackQuery):
+    await callback.message.edit_text(
+        "ℹ️ ПОМОЩЬ\n\n"
+        "📝 Создать материал\n"
+        "Загрузите до 10 книг и выберите "
+        "параметры будущей работы.\n\n"
+        "📖 Источники\n"
+        "Материал создаётся на основе "
+        "загруженных источников.\n\n"
+        "🧠 Спросить AI\n"
+        "Можно задать вопрос по книгам.\n\n"
+        "⭐ Генерации\n"
+        "Одна генерация списывается только "
+        "после подтверждения запуска.\n\n"
+        "💡 Предложения\n"
+        "Сообщите об ошибке или предложите "
+        "новую функцию.",
+        reply_markup=back_menu()
+    )
+
+    await callback.answer()
+
+
+# ============================================================
+# SUGGESTIONS
+# ============================================================
+
+@dp.callback_query(F.data == "suggestions")
+async def suggestions_start(
+    callback: CallbackQuery,
+    state: FSMContext
+):
+    await state.clear()
+
+    await state.set_state(
+        SuggestionStates.waiting_text
+    )
+
+    await callback.message.edit_text(
+        "💡 ПРЕДЛОЖЕНИЯ ПО УЛУЧШЕНИЮ\n\n"
+        "Напишите своё предложение, идею "
+        "или сообщите об ошибке.\n\n"
+        "Например:\n"
+        "«Добавьте выбор оформления презентации»\n\n"
+        "Ваше сообщение увидит администрация.",
+        reply_markup=back_menu()
+    )
+
+    await callback.answer()
+
+
+@dp.message(
+    SuggestionStates.waiting_text,
+    F.text
+)
+async def save_suggestion(
+    message: Message,
+    state: FSMContext
+):
+    text = message.text.strip()
+
+    if len(text) < 3:
+        await message.answer(
+            "❌ Напишите предложение подробнее."
+        )
+        return
+
+    now = datetime.now().isoformat()
+
+    conn = db()
+
+    cur = conn.execute("""
+        INSERT INTO suggestions
+        (
+            telegram_id,
+            username,
+            text,
+            status,
+            created_at,
+            updated_at
+        )
+        VALUES (?, ?, ?, 'new', ?, ?)
+    """, (
+        message.from_user.id,
+        message.from_user.username or "",
+        text,
+        now,
+        now
+    ))
+
+    suggestion_id = cur.lastrowid
+
+    conn.commit()
+    conn.close()
+
+    await state.clear()
 
     await message.answer(
-        "✅ <b>Оплата прошла успешно!</b>\n\n"
-        f"⭐ Пакет: <b>{package['name']}</b>\n"
-        f"➕ Начислено: "
-        f"<b>{package['generations']}</b> генераций\n"
-        f"💰 Текущий баланс: "
-        f"<b>{user['generations']}</b>",
-        parse_mode="HTML",
+        f"✅ Предложение #{suggestion_id} отправлено!\n\n"
+        "Спасибо. Администратор сможет "
+        "просмотреть его в панели.",
         reply_markup=main_menu()
     )
 
 
 # ============================================================
-# ADMIN CHECK
+# ADMIN PANEL
 # ============================================================
 
-def is_admin(telegram_id: int):
-    return (
-        ADMIN_ID != 0
-        and telegram_id == ADMIN_ID
+def admin_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="👥 Пользователи",
+                    callback_data="admin_users"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⭐ Генерации",
+                    callback_data="admin_generations"
+                ),
+                InlineKeyboardButton(
+                    text="🛡 Администраторы",
+                    callback_data="admin_admins"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📚 Книги",
+                    callback_data="admin_books"
+                ),
+                InlineKeyboardButton(
+                    text="📄 Материалы",
+                    callback_data="admin_materials"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="💳 Платежи",
+                    callback_data="admin_payments"
+                ),
+                InlineKeyboardButton(
+                    text="🎁 Рефералы",
+                    callback_data="admin_referrals"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="💡 Предложения",
+                    callback_data="admin_suggestions"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📊 Статистика",
+                    callback_data="admin_stats"
+                ),
+                InlineKeyboardButton(
+                    text="📋 Логи",
+                    callback_data="admin_logs"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🤖 AI",
+                    callback_data="admin_ai"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📢 Рассылка",
+                    callback_data="admin_broadcast"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ Главное меню",
+                    callback_data="main_menu"
+                )
+            ]
+        ]
     )
 
 
-async def admin_required(
-    callback: CallbackQuery
-):
+@dp.message(Command("apanel"))
+async def apanel(message: Message):
+    ensure_user(message)
 
-    if not is_admin(
-        callback.from_user.id
-    ):
-
-        await callback.answer(
-            "⛔ Нет доступа.",
-            show_alert=True
-        )
-
-        return False
-
-    return True
-
-
-# ============================================================
-# ADMIN COMMAND
-# ============================================================
-
-@dp.message(Command("admin"))
-async def admin_command(
-    message: Message
-):
-
-    create_user(message)
-
-    if not is_admin(
-        message.from_user.id
-    ):
-
+    if not is_admin(message.from_user.id):
         await message.answer(
             "⛔ Доступ запрещён."
         )
+        return
 
+    role = get_admin_role(
+        message.from_user.id
+    )
+
+    await message.answer(
+        "👑 ZOLOG AI — АДМИН-ПАНЕЛЬ\n\n"
+        f"Ваша роль: {role}\n\n"
+        "Выберите раздел:",
+        reply_markup=admin_keyboard()
+    )
+
+
+# ============================================================
+# AHELP
+# ============================================================
+
+@dp.message(Command("ahelp"))
+async def ahelp(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer(
+            "⛔ Доступ запрещён."
+        )
         return
 
     await message.answer(
-        "🛡️ <b>Админ-панель Zolog AI</b>",
-        reply_markup=admin_menu(),
-        parse_mode="HTML"
+        "🛡 АДМИН-КОМАНДЫ\n\n"
+        "/apanel — админ-панель\n"
+        "/ahelp — список команд\n\n"
+        "/users — пользователи\n"
+        "/user ID — информация о пользователе\n\n"
+        "/give ID N — выдать N генераций\n"
+        "/take ID N — забрать N генераций\n"
+        "/setgen ID N — установить баланс\n\n"
+        "/admins — список администраторов\n"
+        "/addadmin ID — добавить администратора\n"
+        "/removeadmin ID — удалить администратора\n\n"
+        "/ban ID — заблокировать\n"
+        "/unban ID — разблокировать\n\n"
+        "/stats — статистика\n\n"
+        "👑 Команда владельца:\n"
+        "/addzolog СЕКРЕТНЫЙ_КОД\n\n"
+        "Секрет хранится в Render Environment."
     )
 
 
 # ============================================================
-# ADMIN DASHBOARD
+# ADDZOLOG
 # ============================================================
 
-@dp.callback_query(
-    F.data == "admin_dashboard"
-)
-async def admin_dashboard(
-    callback: CallbackQuery
-):
+@dp.message(Command("addzolog"))
+async def addzolog(message: Message):
+    """
+    Безопасная версия:
+    /addzolog СЕКРЕТ
 
-    if not await admin_required(
-        callback
-    ):
+    Секрет НЕ хранится в коде.
+    Он задаётся в Render:
+    ADDZOLOG_SECRET
+    """
+
+    if not ADDZOLOG_SECRET:
+        await message.answer(
+            "❌ Команда владельца не настроена."
+        )
         return
 
-    users = db.execute(
-        "SELECT COUNT(*) AS c FROM users"
-    ).fetchone()["c"]
+    parts = message.text.split(maxsplit=1)
 
-    materials = db.execute(
-        "SELECT COUNT(*) AS c FROM materials"
-    ).fetchone()["c"]
-
-    books = db.execute(
-        "SELECT COUNT(*) AS c FROM books"
-    ).fetchone()["c"]
-
-    referrals = db.execute(
-        "SELECT COUNT(*) AS c FROM referrals"
-    ).fetchone()["c"]
-
-    payments = db.execute(
-        "SELECT COUNT(*) AS c FROM payments"
-    ).fetchone()["c"]
-
-    stars = db.execute(
-        "SELECT COALESCE(SUM(stars), 0) AS s FROM payments"
-    ).fetchone()["s"]
-
-    text = (
-        "📊 <b>Dashboard</b>\n\n"
-        f"👥 Пользователей: <b>{users}</b>\n"
-        f"📝 Материалов: <b>{materials}</b>\n"
-        f"📚 Книг: <b>{books}</b>\n"
-        f"🎁 Рефералов: <b>{referrals}</b>\n"
-        f"💳 Платежей: <b>{payments}</b>\n"
-        f"⭐ Получено Stars: <b>{stars}</b>"
-    )
-
-    await callback.message.edit_text(
-        text,
-        reply_markup=admin_menu(),
-        parse_mode="HTML"
-    )
-
-
-# ============================================================
-# ADMIN USERS
-# ============================================================
-
-@dp.callback_query(
-    F.data == "admin_users"
-)
-async def admin_users(
-    callback: CallbackQuery
-):
-
-    if not await admin_required(
-        callback
-    ):
+    if len(parts) != 2:
+        await message.answer(
+            "❌ Использование:\n"
+            "/addzolog СЕКРЕТ"
+        )
         return
 
-    total = db.execute(
-        "SELECT COUNT(*) AS c FROM users"
-    ).fetchone()["c"]
+    supplied_secret = parts[1].strip()
 
-    active = db.execute(
-        """
-        SELECT COUNT(*) AS c
+    if supplied_secret != ADDZOLOG_SECRET:
+        await message.answer(
+            "⛔ Неверный секретный код."
+        )
+        return
+
+    user_id = message.from_user.id
+
+    conn = db()
+
+    conn.execute("""
+        INSERT INTO admins
+        (
+            telegram_id,
+            role,
+            added_by,
+            created_at
+        )
+        VALUES (?, 'owner', ?, ?)
+        ON CONFLICT(telegram_id)
+        DO UPDATE SET role = 'owner'
+    """, (
+        user_id,
+        user_id,
+        datetime.now().isoformat()
+    ))
+
+    conn.commit()
+    conn.close()
+
+    log_admin(
+        user_id,
+        "owner_access_granted",
+        user_id,
+        "Activated via /addzolog"
+    )
+
+    await message.answer(
+        "👑 Права владельца активированы.\n\n"
+        "Теперь у этого аккаунта полный доступ "
+        "к админ-панели Zolog AI.\n\n"
+        "Открыть:\n"
+        "/apanel"
+    )
+
+
+# ============================================================
+# ADMIN — USERS
+# ============================================================
+
+@dp.message(Command("users"))
+async def users_command(message: Message):
+    if not admin_allowed(
+        message.from_user.id,
+        ROLE_MODERATOR
+    ):
+        await message.answer(
+            "⛔ Недостаточно прав."
+        )
+        return
+
+    conn = db()
+
+    users = conn.execute("""
+        SELECT telegram_id, username,
+               first_name, generations,
+               created_at
         FROM users
-        WHERE is_blocked = 0
-        """
-    ).fetchone()["c"]
+        ORDER BY id DESC
+        LIMIT 30
+    """).fetchall()
 
-    blocked = db.execute(
-        """
-        SELECT COUNT(*) AS c
-        FROM users
-        WHERE is_blocked = 1
-        """
-    ).fetchone()["c"]
+    conn.close()
 
-    text = (
-        "👥 <b>Пользователи</b>\n\n"
-        f"Всего: <b>{total}</b>\n"
-        f"Активных: <b>{active}</b>\n"
-        f"Заблокированных: <b>{blocked}</b>"
-    )
-
-    await callback.message.edit_text(
-        text,
-        reply_markup=admin_menu(),
-        parse_mode="HTML"
-    )
-
-
-# ============================================================
-# ADMIN MATERIALS
-# ============================================================
-
-@dp.callback_query(
-    F.data == "admin_materials"
-)
-async def admin_materials(
-    callback: CallbackQuery
-):
-
-    if not await admin_required(
-        callback
-    ):
+    if not users:
+        await message.answer(
+            "Пользователей нет."
+        )
         return
 
-    total = db.execute(
-        "SELECT COUNT(*) AS c FROM materials"
-    ).fetchone()["c"]
+    lines = ["👥 ПОСЛЕДНИЕ ПОЛЬЗОВАТЕЛИ\n"]
 
-    text = (
-        "🗄️ <b>Материалы</b>\n\n"
-        f"Всего создано: <b>{total}</b>"
+    for user in users:
+        lines.append(
+            f"🆔 {user['telegram_id']}\n"
+            f"👤 @{user['username'] or 'нет'}\n"
+            f"⭐ {user['generations']}"
+        )
+
+    await message.answer(
+        "\n\n".join(lines)
     )
 
-    await callback.message.edit_text(
-        text,
-        reply_markup=admin_menu(),
-        parse_mode="HTML"
-    )
 
-
-# ============================================================
-# ADMIN BOOKS
-# ============================================================
-
-@dp.callback_query(
-    F.data == "admin_books"
-)
-async def admin_books(
-    callback: CallbackQuery
-):
-
-    if not await admin_required(
-        callback
+@dp.message(Command("user"))
+async def user_command(message: Message):
+    if not admin_allowed(
+        message.from_user.id,
+        ROLE_MODERATOR
     ):
+        await message.answer(
+            "⛔ Недостаточно прав."
+        )
         return
 
-    total = db.execute(
-        "SELECT COUNT(*) AS c FROM books"
-    ).fetchone()["c"]
+    parts = message.text.split()
 
-    text = (
-        "📚 <b>Книги</b>\n\n"
-        f"Загружено книг: <b>{total}</b>"
+    if len(parts) < 2:
+        await message.answer(
+            "Использование:\n/user ID"
+        )
+        return
+
+    try:
+        user_id = int(parts[1])
+    except ValueError:
+        await message.answer(
+            "❌ Неверный ID."
+        )
+        return
+
+    user = get_user(user_id)
+
+    if not user:
+        await message.answer(
+            "❌ Пользователь не найден."
+        )
+        return
+
+    conn = db()
+
+    books = conn.execute(
+        "SELECT COUNT(*) FROM books WHERE telegram_id = ?",
+        (user_id,)
+    ).fetchone()[0]
+
+    materials = conn.execute(
+        "SELECT COUNT(*) FROM materials WHERE telegram_id = ?",
+        (user_id,)
+    ).fetchone()[0]
+
+    conn.close()
+
+    await message.answer(
+        "👤 ПОЛЬЗОВАТЕЛЬ\n\n"
+        f"ID: {user_id}\n"
+        f"Username: @{user['username'] or 'нет'}\n"
+        f"Имя: {user['first_name']}\n"
+        f"Генерации: {user['generations']}\n"
+        f"Книги: {books}\n"
+        f"Материалы: {materials}\n"
+        f"Регистрация: {user['created_at']}"
     )
+
+
+# ============================================================
+# GENERATION MANAGEMENT
+# ============================================================
+
+@dp.message(Command("give"))
+async def give_generations(message: Message):
+    if not admin_allowed(
+        message.from_user.id,
+        ROLE_ADMIN
+    ):
+        await message.answer(
+            "⛔ Недостаточно прав."
+        )
+        return
+
+    parts = message.text.split()
+
+    if len(parts) != 3:
+        await message.answer(
+            "Использование:\n"
+            "/give ID количество"
+        )
+        return
+
+    try:
+        target = int(parts[1])
+        amount = int(parts[2])
+    except ValueError:
+        await message.answer(
+            "❌ Неверные значения."
+        )
+        return
+
+    add_generations(
+        target,
+        amount
+    )
+
+    log_admin(
+        message.from_user.id,
+        "give_generations",
+        target,
+        f"+{amount}"
+    )
+
+    await message.answer(
+        f"✅ Пользователю {target} выдано "
+        f"+{amount} генераций.\n\n"
+        f"Новый баланс: {get_generations(target)}"
+    )
+
+
+@dp.message(Command("take"))
+async def take_generations(message: Message):
+    if not admin_allowed(
+        message.from_user.id,
+        ROLE_ADMIN
+    ):
+        await message.answer(
+            "⛔ Недостаточно прав."
+        )
+        return
+
+    parts = message.text.split()
+
+    if len(parts) != 3:
+        await message.answer(
+            "Использование:\n"
+            "/take ID количество"
+        )
+        return
+
+    try:
+        target = int(parts[1])
+        amount = int(parts[2])
+    except ValueError:
+        await message.answer(
+            "❌ Неверные значения."
+        )
+        return
+
+    add_generations(
+        target,
+        -abs(amount)
+    )
+
+    log_admin(
+        message.from_user.id,
+        "take_generations",
+        target,
+        f"-{amount}"
+    )
+
+    await message.answer(
+        f"✅ У пользователя {target} забрано "
+        f"{amount} генераций.\n\n"
+        f"Новый баланс: {get_generations(target)}"
+    )
+
+
+@dp.message(Command("setgen"))
+async def setgen_command(message: Message):
+    if not admin_allowed(
+        message.from_user.id,
+        ROLE_ADMIN
+    ):
+        await message.answer(
+            "⛔ Недостаточно прав."
+        )
+        return
+
+    parts = message.text.split()
+
+    if len(parts) != 3:
+        await message.answer(
+            "Использование:\n"
+            "/setgen ID количество"
+        )
+        return
+
+    try:
+        target = int(parts[1])
+        amount = int(parts[2])
+    except ValueError:
+        await message.answer(
+            "❌ Неверные значения."
+        )
+        return
+
+    set_generations(
+        target,
+        amount
+    )
+
+    log_admin(
+        message.from_user.id,
+        "set_generations",
+        target,
+        str(amount)
+    )
+
+    await message.answer(
+        f"✅ Баланс пользователя {target} "
+        f"установлен на {amount}."
+    )
+
+
+# ============================================================
+# ADMIN MANAGEMENT
+# ============================================================
+
+@dp.message(Command("admins"))
+async def admins_command(message: Message):
+    if not is_admin(
+        message.from_user.id
+    ):
+        await message.answer(
+            "⛔ Доступ запрещён."
+        )
+        return
+
+    conn = db()
+
+    admins = conn.execute("""
+        SELECT *
+        FROM admins
+        ORDER BY created_at
+    """).fetchall()
+
+    conn.close()
+
+    lines = [
+        "🛡 АДМИНИСТРАТОРЫ\n"
+    ]
+
+    for admin in admins:
+        lines.append(
+            f"🆔 {admin['telegram_id']}\n"
+            f"Роль: {admin['role']}"
+        )
+
+    await message.answer(
+        "\n\n".join(lines)
+    )
+
+
+@dp.message(Command("addadmin"))
+async def addadmin_command(message: Message):
+    if not is_owner(
+        message.from_user.id
+    ):
+        await message.answer(
+            "⛔ Только владелец может "
+            "добавлять администраторов."
+        )
+        return
+
+    parts = message.text.split()
+
+    if len(parts) != 2:
+        await message.answer(
+            "Использование:\n/addadmin ID"
+        )
+        return
+
+    try:
+        target = int(parts[1])
+    except ValueError:
+        await message.answer(
+            "❌ Неверный ID."
+        )
+        return
+
+    conn = db()
+
+    conn.execute("""
+        INSERT INTO admins
+        (
+            telegram_id,
+            role,
+            added_by,
+            created_at
+        )
+        VALUES (?, 'admin', ?, ?)
+        ON CONFLICT(telegram_id)
+        DO UPDATE SET role = 'admin'
+    """, (
+        target,
+        message.from_user.id,
+        datetime.now().isoformat()
+    ))
+
+    conn.commit()
+    conn.close()
+
+    log_admin(
+        message.from_user.id,
+        "add_admin",
+        target
+    )
+
+    await message.answer(
+        f"🛡 Пользователь {target} "
+        f"назначен администратором."
+    )
+
+
+@dp.message(Command("removeadmin"))
+async def removeadmin_command(message: Message):
+    if not is_owner(
+        message.from_user.id
+    ):
+        await message.answer(
+            "⛔ Только владелец."
+        )
+        return
+
+    parts = message.text.split()
+
+    if len(parts) != 2:
+        await message.answer(
+            "Использование:\n/removeadmin ID"
+        )
+        return
+
+    try:
+        target = int(parts[1])
+    except ValueError:
+        await message.answer(
+            "❌ Неверный ID."
+        )
+        return
+
+    if target == message.from_user.id:
+        await message.answer(
+            "❌ Нельзя удалить самого себя."
+        )
+        return
+
+    conn = db()
+
+    conn.execute(
+        "DELETE FROM admins WHERE telegram_id = ?",
+        (target,)
+    )
+
+    conn.commit()
+    conn.close()
+
+    log_admin(
+        message.from_user.id,
+        "remove_admin",
+        target
+    )
+
+    await message.answer(
+        f"✅ Администратор {target} удалён."
+    )
+
+
+# ============================================================
+# BAN
+# ============================================================
+
+@dp.message(Command("ban"))
+async def ban_command(message: Message):
+    if not admin_allowed(
+        message.from_user.id,
+        ROLE_ADMIN
+    ):
+        await message.answer(
+            "⛔ Недостаточно прав."
+        )
+        return
+
+    parts = message.text.split()
+
+    if len(parts) != 2:
+        await message.answer(
+            "/ban ID"
+        )
+        return
+
+    target = int(parts[1])
+
+    conn = db()
+
+    conn.execute("""
+        UPDATE users
+        SET is_banned = 1
+        WHERE telegram_id = ?
+    """, (target,))
+
+    conn.commit()
+    conn.close()
+
+    log_admin(
+        message.from_user.id,
+        "ban",
+        target
+    )
+
+    await message.answer(
+        f"🚫 Пользователь {target} заблокирован."
+    )
+
+
+@dp.message(Command("unban"))
+async def unban_command(message: Message):
+    if not admin_allowed(
+        message.from_user.id,
+        ROLE_ADMIN
+    ):
+        await message.answer(
+            "⛔ Недостаточно прав."
+        )
+        return
+
+    parts = message.text.split()
+
+    if len(parts) != 2:
+        await message.answer(
+            "/unban ID"
+        )
+        return
+
+    target = int(parts[1])
+
+    conn = db()
+
+    conn.execute("""
+        UPDATE users
+        SET is_banned = 0
+        WHERE telegram_id = ?
+    """, (target,))
+
+    conn.commit()
+    conn.close()
+
+    log_admin(
+        message.from_user.id,
+        "unban",
+        target
+    )
+
+    await message.answer(
+        f"✅ Пользователь {target} разблокирован."
+    )
+
+
+# ============================================================
+# ADMIN CALLBACKS
+# ============================================================
+
+@dp.callback_query(F.data == "admin_users")
+async def admin_users(callback: CallbackQuery):
+    if not admin_allowed(
+        callback.from_user.id,
+        ROLE_MODERATOR
+    ):
+        await callback.answer(
+            "Недостаточно прав.",
+            show_alert=True
+        )
+        return
+
+    conn = db()
+
+    count = conn.execute(
+        "SELECT COUNT(*) FROM users"
+    ).fetchone()[0]
+
+    conn.close()
+
+    await callback.message.edit_text(
+        f"👥 Пользователи\n\n"
+        f"Всего: {count}\n\n"
+        "Подробный поиск:\n"
+        "/users\n"
+        "/user ID",
+        reply_markup=admin_keyboard()
+    )
+
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "admin_generations")
+async def admin_generations(callback: CallbackQuery):
+    if not admin_allowed(
+        callback.from_user.id,
+        ROLE_ADMIN
+    ):
+        await callback.answer(
+            "Недостаточно прав.",
+            show_alert=True
+        )
+        return
+
+    await callback.message.edit_text(
+        "⭐ УПРАВЛЕНИЕ ГЕНЕРАЦИЯМИ\n\n"
+        "/give ID N — выдать\n"
+        "/take ID N — забрать\n"
+        "/setgen ID N — установить\n\n"
+        "Можно выдавать генерации себе "
+        "или любому пользователю.",
+        reply_markup=admin_keyboard()
+    )
+
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "admin_admins")
+async def admin_admins(callback: CallbackQuery):
+    if not is_admin(
+        callback.from_user.id
+    ):
+        await callback.answer(
+            "Недостаточно прав.",
+            show_alert=True
+        )
+        return
+
+    await callback.message.edit_text(
+        "🛡 АДМИНИСТРАТОРЫ\n\n"
+        "/admins — список\n"
+        "/addadmin ID — добавить\n"
+        "/removeadmin ID — удалить\n\n"
+        "👑 Владелец имеет полный доступ.",
+        reply_markup=admin_keyboard()
+    )
+
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "admin_books")
+async def admin_books(callback: CallbackQuery):
+    if not admin_allowed(
+        callback.from_user.id,
+        ROLE_MODERATOR
+    ):
+        await callback.answer(
+            "Недостаточно прав.",
+            show_alert=True
+        )
+        return
+
+    conn = db()
+
+    total = conn.execute(
+        "SELECT COUNT(*) FROM books"
+    ).fetchone()[0]
+
+    conn.close()
+
+    await callback.message.edit_text(
+        f"📚 КНИГИ\n\n"
+        f"Всего загружено: {total}",
+        reply_markup=admin_keyboard()
+    )
+
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "admin_materials")
+async def admin_materials(callback: CallbackQuery):
+    if not admin_allowed(
+        callback.from_user.id,
+        ROLE_MODERATOR
+    ):
+        await callback.answer(
+            "Недостаточно прав.",
+            show_alert=True
+        )
+        return
+
+    conn = db()
+
+    total = conn.execute(
+        "SELECT COUNT(*) FROM materials"
+    ).fetchone()[0]
+
+    generating = conn.execute("""
+        SELECT COUNT(*)
+        FROM materials
+        WHERE status = 'generating'
+    """).fetchone()[0]
+
+    completed = conn.execute("""
+        SELECT COUNT(*)
+        FROM materials
+        WHERE status = 'completed'
+    """).fetchone()[0]
+
+    conn.close()
+
+    await callback.message.edit_text(
+        "📄 МАТЕРИАЛЫ\n\n"
+        f"Всего: {total}\n"
+        f"⏳ Генерируется: {generating}\n"
+        f"✅ Готово: {completed}",
+        reply_markup=admin_keyboard()
+    )
+
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "admin_payments")
+async def admin_payments(callback: CallbackQuery):
+    if not admin_allowed(
+        callback.from_user.id,
+        ROLE_ADMIN
+    ):
+        await callback.answer(
+            "Недостаточно прав.",
+            show_alert=True
+        )
+        return
+
+    conn = db()
+
+    total = conn.execute("""
+        SELECT COALESCE(SUM(stars), 0)
+        FROM payments
+    """).fetchone()[0]
+
+    payments = conn.execute(
+        "SELECT COUNT(*) FROM payments"
+    ).fetchone()[0]
+
+    conn.close()
+
+    await callback.message.edit_text(
+        "💳 ПЛАТЕЖИ\n\n"
+        f"Платежей: {payments}\n"
+        f"Stars получено: {total}",
+        reply_markup=admin_keyboard()
+    )
+
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "admin_referrals")
+async def admin_referrals(callback: CallbackQuery):
+    if not admin_allowed(
+        callback.from_user.id,
+        ROLE_ADMIN
+    ):
+        await callback.answer(
+            "Недостаточно прав.",
+            show_alert=True
+        )
+        return
+
+    conn = db()
+
+    count = conn.execute(
+        "SELECT COUNT(*) FROM referrals"
+    ).fetchone()[0]
+
+    conn.close()
+
+    await callback.message.edit_text(
+        f"🎁 РЕФЕРАЛЫ\n\n"
+        f"Всего приглашений: {count}",
+        reply_markup=admin_keyboard()
+    )
+
+    await callback.answer()
+
+
+# ============================================================
+# ADMIN SUGGESTIONS
+# ============================================================
+
+@dp.callback_query(F.data == "admin_suggestions")
+async def admin_suggestions(callback: CallbackQuery):
+    if not admin_allowed(
+        callback.from_user.id,
+        ROLE_MODERATOR
+    ):
+        await callback.answer(
+            "Недостаточно прав.",
+            show_alert=True
+        )
+        return
+
+    conn = db()
+
+    total = conn.execute(
+        "SELECT COUNT(*) FROM suggestions"
+    ).fetchone()[0]
+
+    new = conn.execute("""
+        SELECT COUNT(*)
+        FROM suggestions
+        WHERE status = 'new'
+    """).fetchone()[0]
+
+    viewed = conn.execute("""
+        SELECT COUNT(*)
+        FROM suggestions
+        WHERE status = 'viewed'
+    """).fetchone()[0]
+
+    working = conn.execute("""
+        SELECT COUNT(*)
+        FROM suggestions
+        WHERE status = 'working'
+    """).fetchone()[0]
+
+    implemented = conn.execute("""
+        SELECT COUNT(*)
+        FROM suggestions
+        WHERE status = 'implemented'
+    """).fetchone()[0]
+
+    rejected = conn.execute("""
+        SELECT COUNT(*)
+        FROM suggestions
+        WHERE status = 'rejected'
+    """).fetchone()[0]
+
+    conn.close()
+
+    await callback.message.edit_text(
+        "💡 ПРЕДЛОЖЕНИЯ\n\n"
+        f"Всего: {total}\n"
+        f"🆕 Новые: {new}\n"
+        f"👀 Просмотрены: {viewed}\n"
+        f"🔨 В работе: {working}\n"
+        f"✅ Реализованы: {implemented}\n"
+        f"❌ Отклонены: {rejected}\n\n"
+        "Команда просмотра:\n"
+        "/suggestions",
+        reply_markup=admin_keyboard()
+    )
+
+    await callback.answer()
+
+
+@dp.message(Command("suggestions"))
+async def suggestions_command(message: Message):
+    if not admin_allowed(
+        message.from_user.id,
+        ROLE_MODERATOR
+    ):
+        await message.answer(
+            "⛔ Недостаточно прав."
+        )
+        return
+
+    conn = db()
+
+    suggestions = conn.execute("""
+        SELECT *
+        FROM suggestions
+        ORDER BY id DESC
+        LIMIT 30
+    """).fetchall()
+
+    conn.close()
+
+    if not suggestions:
+        await message.answer(
+            "💡 Предложений пока нет."
+        )
+        return
+
+    lines = [
+        "💡 ВСЕ ПРЕДЛОЖЕНИЯ\n"
+    ]
+
+    status_names = {
+        "new": "🆕 Новое",
+        "viewed": "👀 Просмотрено",
+        "working": "🔨 В работе",
+        "implemented": "✅ Реализовано",
+        "rejected": "❌ Отклонено"
+    }
+
+    for item in suggestions:
+        lines.append(
+            f"#{item['id']} — "
+            f"{status_names.get(item['status'], item['status'])}\n"
+            f"ID: {item['telegram_id']}\n"
+            f"@{item['username'] or 'нет'}\n"
+            f"{item['text'][:300]}"
+        )
+
+    await message.answer(
+        "\n\n".join(lines)
+    )
+
+
+# ============================================================
+# ADMIN STATS
+# ============================================================
+
+@dp.message(Command("stats"))
+async def stats_command(message: Message):
+    if not admin_allowed(
+        message.from_user.id,
+        ROLE_ANALYST
+    ):
+        await message.answer(
+            "⛔ Недостаточно прав."
+        )
+        return
+
+    conn = db()
+
+    users = conn.execute(
+        "SELECT COUNT(*) FROM users"
+    ).fetchone()[0]
+
+    books = conn.execute(
+        "SELECT COUNT(*) FROM books"
+    ).fetchone()[0]
+
+    materials = conn.execute(
+        "SELECT COUNT(*) FROM materials"
+    ).fetchone()[0]
+
+    suggestions = conn.execute(
+        "SELECT COUNT(*) FROM suggestions"
+    ).fetchone()[0]
+
+    generations = conn.execute(
+        "SELECT COALESCE(SUM(generations), 0) FROM users"
+    ).fetchone()[0]
+
+    stars = conn.execute(
+        "SELECT COALESCE(SUM(stars), 0) FROM payments"
+    ).fetchone()[0]
+
+    referrals = conn.execute(
+        "SELECT COUNT(*) FROM referrals"
+    ).fetchone()[0]
+
+    conn.close()
+
+    await message.answer(
+        "📊 СТАТИСТИКА ZOLOG AI\n\n"
+        f"👥 Пользователи: {users}\n"
+        f"📖 Книги: {books}\n"
+        f"📄 Материалы: {materials}\n"
+        f"⭐ Генераций на балансах: {generations}\n"
+        f"💳 Stars: {stars}\n"
+        f"🎁 Рефералы: {referrals}\n"
+        f"💡 Предложения: {suggestions}"
+    )
+
+
+@dp.callback_query(F.data == "admin_stats")
+async def admin_stats(callback: CallbackQuery):
+    if not admin_allowed(
+        callback.from_user.id,
+        ROLE_ANALYST
+    ):
+        await callback.answer(
+            "Недостаточно прав.",
+            show_alert=True
+        )
+        return
+
+    await callback.message.edit_text(
+        "📊 СТАТИСТИКА\n\n"
+        "Используйте:\n"
+        "/stats",
+        reply_markup=admin_keyboard()
+    )
+
+    await callback.answer()
+
+
+# ============================================================
+# LOGS
+# ============================================================
+
+@dp.callback_query(F.data == "admin_logs")
+async def admin_logs(callback: CallbackQuery):
+    if not admin_allowed(
+        callback.from_user.id,
+        ROLE_ADMIN
+    ):
+        await callback.answer(
+            "Недостаточно прав.",
+            show_alert=True
+        )
+        return
+
+    conn = db()
+
+    logs = conn.execute("""
+        SELECT *
+        FROM logs
+        ORDER BY id DESC
+        LIMIT 20
+    """).fetchall()
+
+    conn.close()
+
+    if not logs:
+        text = "📋 Логов пока нет."
+
+    else:
+        lines = [
+            "📋 ПОСЛЕДНИЕ ДЕЙСТВИЯ\n"
+        ]
+
+        for log in logs:
+            lines.append(
+                f"{log['created_at']}\n"
+                f"Admin: {log['admin_id']}\n"
+                f"{log['action']}\n"
+                f"Target: {log['target_id'] or '-'}\n"
+                f"{log['details'] or ''}"
+            )
+
+        text = "\n\n".join(lines)
 
     await callback.message.edit_text(
         text,
-        reply_markup=admin_menu(),
-        parse_mode="HTML"
+        reply_markup=admin_keyboard()
     )
+
+    await callback.answer()
 
 
 # ============================================================
 # ADMIN AI
 # ============================================================
 
-@dp.callback_query(
-    F.data == "admin_ai"
-)
-async def admin_ai(
-    callback: CallbackQuery
-):
-
-    if not await admin_required(
-        callback
+@dp.callback_query(F.data == "admin_ai")
+async def admin_ai(callback: CallbackQuery):
+    if not admin_allowed(
+        callback.from_user.id,
+        ROLE_ADMIN
     ):
-        return
-
-    text = (
-        "🤖 <b>AI</b>\n\n"
-        f"Основная модель:\n"
-        f"<code>{html.escape(GEMINI_MODEL)}</code>\n\n"
-        f"Резервная модель:\n"
-        f"<code>{html.escape(GEMINI_FALLBACK_MODEL)}</code>\n\n"
-        "🔄 Повторы при временных ошибках: "
-        "<b>включены</b>\n\n"
-        "🔁 Переключение при 429/лимите: "
-        "<b>включено</b>\n\n"
-        "⏱ Задержки:\n"
-        "3 → 6 → 12 → 20 секунд"
-    )
-
-    await callback.message.edit_text(
-        text,
-        reply_markup=admin_menu(),
-        parse_mode="HTML"
-    )
-
-
-# ============================================================
-# ADMIN REFERRALS
-# ============================================================
-
-@dp.callback_query(
-    F.data == "admin_referrals"
-)
-async def admin_referrals(
-    callback: CallbackQuery
-):
-
-    if not await admin_required(
-        callback
-    ):
-        return
-
-    total = db.execute(
-        "SELECT COUNT(*) AS c FROM referrals"
-    ).fetchone()["c"]
-
-    text = (
-        "🎁 <b>Реферальная система</b>\n\n"
-        f"Всего приглашений: <b>{total}</b>\n"
-        f"Награда: <b>+{REFERRAL_REWARD}</b> генерация"
-    )
-
-    await callback.message.edit_text(
-        text,
-        reply_markup=admin_menu(),
-        parse_mode="HTML"
-    )
-
-
-# ============================================================
-# ADMIN PAYMENTS
-# ============================================================
-
-@dp.callback_query(
-    F.data == "admin_payments"
-)
-async def admin_payments(
-    callback: CallbackQuery
-):
-
-    if not await admin_required(
-        callback
-    ):
-        return
-
-    payments = db.execute(
-        "SELECT COUNT(*) AS c FROM payments"
-    ).fetchone()["c"]
-
-    stars = db.execute(
-        """
-        SELECT COALESCE(SUM(stars), 0) AS s
-        FROM payments
-        """
-    ).fetchone()["s"]
-
-    generations = db.execute(
-        """
-        SELECT COALESCE(SUM(generations), 0) AS g
-        FROM payments
-        """
-    ).fetchone()["g"]
-
-    text = (
-        "💳 <b>Оплаты</b>\n\n"
-        f"Платежей: <b>{payments}</b>\n"
-        f"⭐ Stars: <b>{stars}</b>\n"
-        f"➕ Начислено генераций: "
-        f"<b>{generations}</b>"
-    )
-
-    await callback.message.edit_text(
-        text,
-        reply_markup=admin_menu(),
-        parse_mode="HTML"
-    )
-
-
-# ============================================================
-# ADMIN PAYMENT STATS
-# ============================================================
-
-@dp.callback_query(
-    F.data == "admin_payment_stats"
-)
-async def admin_payment_stats(
-    callback: CallbackQuery
-):
-
-    if not await admin_required(
-        callback
-    ):
-        return
-
-    total_stars = db.execute(
-        """
-        SELECT COALESCE(SUM(stars), 0) AS s
-        FROM payments
-        """
-    ).fetchone()["s"]
-
-    total_payments = db.execute(
-        """
-        SELECT COUNT(*) AS c
-        FROM payments
-        """
-    ).fetchone()["c"]
-
-    paying_users = db.execute(
-        """
-        SELECT COUNT(DISTINCT telegram_id) AS c
-        FROM payments
-        """
-    ).fetchone()["c"]
-
-    average = (
-        round(
-            total_stars / total_payments,
-            2
+        await callback.answer(
+            "Недостаточно прав.",
+            show_alert=True
         )
-        if total_payments
-        else 0
-    )
+        return
 
-    today = (
-        datetime.now()
-        .replace(
-            hour=0,
-            minute=0,
-            second=0,
-            microsecond=0
-        )
-        .strftime("%Y-%m-%d %H:%M:%S")
-    )
-
-    week = (
-        datetime.now() - timedelta(days=7)
-    ).strftime(
-        "%Y-%m-%d %H:%M:%S"
-    )
-
-    month = (
-        datetime.now() - timedelta(days=30)
-    ).strftime(
-        "%Y-%m-%d %H:%M:%S"
-    )
-
-    today_stars = db.execute(
-        """
-        SELECT COALESCE(SUM(stars), 0) AS s
-        FROM payments
-        WHERE created_at >= ?
-        """,
-        (today,)
-    ).fetchone()["s"]
-
-    week_stars = db.execute(
-        """
-        SELECT COALESCE(SUM(stars), 0) AS s
-        FROM payments
-        WHERE created_at >= ?
-        """,
-        (week,)
-    ).fetchone()["s"]
-
-    month_stars = db.execute(
-        """
-        SELECT COALESCE(SUM(stars), 0) AS s
-        FROM payments
-        WHERE created_at >= ?
-        """,
-        (month,)
-    ).fetchone()["s"]
-
-    popular = db.execute(
-        """
-        SELECT package, COUNT(*) AS c
-        FROM payments
-        GROUP BY package
-        ORDER BY c DESC
-        LIMIT 1
-        """
-    ).fetchone()
-
-    popular_package = (
-        popular["package"]
-        if popular
-        else "нет данных"
-    )
-
-    text = (
-        "📈 <b>Статистика оплат</b>\n\n"
-        f"⭐ Всего Stars: <b>{total_stars}</b>\n"
-        f"💳 Всего платежей: <b>{total_payments}</b>\n"
-        f"👥 Платящих пользователей: "
-        f"<b>{paying_users}</b>\n"
-        f"📊 Средний платёж: "
-        f"<b>{average} ⭐</b>\n\n"
-        f"Сегодня: <b>{today_stars} ⭐</b>\n"
-        f"7 дней: <b>{week_stars} ⭐</b>\n"
-        f"30 дней: <b>{month_stars} ⭐</b>\n\n"
-        f"🏆 Популярный пакет: "
-        f"<b>{popular_package}</b>"
+    status = (
+        "🟢 API key настроен"
+        if GEMINI_API_KEY
+        else "🔴 API key отсутствует"
     )
 
     await callback.message.edit_text(
-        text,
-        reply_markup=admin_menu(),
-        parse_mode="HTML"
-    )
-
-
-# ============================================================
-# ADMIN BROADCAST
-# ============================================================
-
-@dp.callback_query(
-    F.data == "admin_broadcast"
-)
-async def admin_broadcast(
-    callback: CallbackQuery
-):
-
-    if not await admin_required(
-        callback
-    ):
-        return
-
-    await callback.message.edit_text(
-        "📢 <b>Рассылки</b>\n\n"
-        "Система массовых рассылок подготовлена "
-        "для дальнейшего расширения.",
-        reply_markup=admin_menu(),
-        parse_mode="HTML"
-    )
-
-
-# ============================================================
-# ADMIN MODERATION
-# ============================================================
-
-@dp.callback_query(
-    F.data == "admin_moderation"
-)
-async def admin_moderation(
-    callback: CallbackQuery
-):
-
-    if not await admin_required(
-        callback
-    ):
-        return
-
-    await callback.message.edit_text(
-        "🛡️ <b>Модерация</b>\n\n"
-        "Раздел модерации подготовлен "
-        "для дальнейшего расширения.",
-        reply_markup=admin_menu(),
-        parse_mode="HTML"
-    )
-
-
-# ============================================================
-# ADMIN LOGS
-# ============================================================
-
-@dp.callback_query(
-    F.data == "admin_logs"
-)
-async def admin_logs(
-    callback: CallbackQuery
-):
-
-    if not await admin_required(
-        callback
-    ):
-        return
-
-    logs = db.execute(
-        """
-        SELECT *
-        FROM logs
-        ORDER BY id DESC
-        LIMIT 10
-        """
-    ).fetchall()
-
-    text = "📝 <b>Последние логи</b>\n\n"
-
-    if not logs:
-
-        text += "Логов пока нет."
-
-    else:
-
-        for item in logs:
-
-            text += (
-                f"• {html.escape(item['action'])} "
-                f"| {item['telegram_id']}\n"
-            )
-
-    await callback.message.edit_text(
-        text,
-        reply_markup=admin_menu(),
-        parse_mode="HTML"
-    )
-
-
-# ============================================================
-# ADMIN TEST MODE
-# ============================================================
-
-@dp.callback_query(
-    F.data == "admin_test"
-)
-async def admin_test(
-    callback: CallbackQuery
-):
-
-    if not await admin_required(
-        callback
-    ):
-        return
-
-    await callback.message.edit_text(
-        "🧪 <b>Test Mode</b>\n\n"
-        "Режим тестирования подготовлен "
-        "для дальнейшего расширения.",
-        reply_markup=admin_menu(),
-        parse_mode="HTML"
-    )
-
-
-# ============================================================
-# ADMIN SETTINGS
-# ============================================================
-
-@dp.callback_query(
-    F.data == "admin_settings"
-)
-async def admin_settings(
-    callback: CallbackQuery
-):
-
-    if not await admin_required(
-        callback
-    ):
-        return
-
-    text = (
-        "⚙️ <b>Настройки Zolog AI</b>\n\n"
+        "🤖 AI СИСТЕМА\n\n"
+        f"{status}\n\n"
         f"Основная модель:\n"
-        f"<code>{html.escape(GEMINI_MODEL)}</code>\n\n"
-        f"Резервная модель:\n"
-        f"<code>{html.escape(GEMINI_FALLBACK_MODEL)}</code>\n\n"
-        f"Стартовые генерации: "
-        f"<b>{START_GENERATIONS}</b>\n"
-        f"Реферальная награда: "
-        f"<b>{REFERRAL_REWARD}</b>"
+        f"{GEMINI_MODEL}\n\n"
+        f"Fallback:\n"
+        f"{GEMINI_FALLBACK_MODEL}\n\n"
+        "При временных ошибках используется "
+        "повторная попытка и fallback-модель.",
+        reply_markup=admin_keyboard()
     )
-
-    await callback.message.edit_text(
-        text,
-        reply_markup=admin_menu(),
-        parse_mode="HTML"
-    )
-
-
-# ============================================================
-# BACK MAIN
-# ============================================================
-
-@dp.callback_query(
-    F.data == "back_main"
-)
-async def back_main(
-    callback: CallbackQuery
-):
 
     await callback.answer()
 
-    clear_state(
+
+# ============================================================
+# BROADCAST
+# ============================================================
+
+@dp.callback_query(F.data == "admin_broadcast")
+async def admin_broadcast(
+    callback: CallbackQuery,
+    state: FSMContext
+):
+    if not is_owner(
         callback.from_user.id
+    ):
+        await callback.answer(
+            "Только владелец.",
+            show_alert=True
+        )
+        return
+
+    await state.set_state(
+        AdminStates.waiting_broadcast
     )
+
+    await callback.message.edit_text(
+        "📢 РАССЫЛКА\n\n"
+        "Отправьте сообщение, которое нужно "
+        "разослать пользователям.\n\n"
+        "После отправки оно будет использовано "
+        "как текст рассылки.",
+        reply_markup=back_menu()
+    )
+
+    await callback.answer()
+
+
+@dp.message(
+    AdminStates.waiting_broadcast,
+    F.text
+)
+async def process_broadcast(
+    message: Message,
+    state: FSMContext
+):
+    if not is_owner(
+        message.from_user.id
+    ):
+        return
+
+    text = message.text
+
+    conn = db()
+
+    users = conn.execute("""
+        SELECT telegram_id
+        FROM users
+        WHERE is_banned = 0
+    """).fetchall()
+
+    conn.close()
+
+    await message.answer(
+        f"📢 Начинаю рассылку.\n"
+        f"Получателей: {len(users)}"
+    )
+
+    success = 0
+
+    for user in users:
+        try:
+            await bot.send_message(
+                user["telegram_id"],
+                text
+            )
+
+            success += 1
+
+            await asyncio.sleep(
+                0.05
+            )
+
+        except Exception:
+            pass
+
+    await message.answer(
+        f"✅ Рассылка завершена.\n\n"
+        f"Успешно: {success}\n"
+        f"Всего: {len(users)}"
+    )
+
+    log_admin(
+        message.from_user.id,
+        "broadcast",
+        details=f"success={success}"
+    )
+
+    await state.clear()
+
+
+# ============================================================
+# ADMIN PANEL CALLBACK
+# ============================================================
+
+@dp.callback_query(F.data == "admin_back")
+async def admin_back(callback: CallbackQuery):
+    if not is_admin(
+        callback.from_user.id
+    ):
+        await callback.answer(
+            "Нет доступа.",
+            show_alert=True
+        )
+        return
+
+    await callback.message.edit_text(
+        "👑 ZOLOG AI — АДМИН-ПАНЕЛЬ",
+        reply_markup=admin_keyboard()
+    )
+
+    await callback.answer()
+
+
+# ============================================================
+# GENERATION PROGRESS COMMAND
+# ============================================================
+
+@dp.message(Command("job"))
+async def job_command(message: Message):
+    parts = message.text.split()
+
+    if len(parts) != 2:
+        await message.answer(
+            "Использование:\n/job ID"
+        )
+        return
+
+    try:
+        job_id = int(parts[1])
+    except ValueError:
+        await message.answer(
+            "❌ Неверный ID."
+        )
+        return
+
+    conn = db()
+
+    job = conn.execute("""
+        SELECT *
+        FROM jobs
+        WHERE id = ?
+          AND telegram_id = ?
+    """, (
+        job_id,
+        message.from_user.id
+    )).fetchone()
+
+    conn.close()
+
+    if not job:
+        await message.answer(
+            "❌ Задача не найдена."
+        )
+        return
+
+    await message.answer(
+        "📊 СТАТУС ГЕНЕРАЦИИ\n\n"
+        f"ID: {job['id']}\n"
+        f"Статус: {job['status']}\n"
+        f"Прогресс: {job['progress']}%\n"
+        f"Этап: {job['stage']}"
+    )
+
+
+# ============================================================
+# BAN CHECK
+# ============================================================
+
+@dp.message()
+async def general_message_handler(
+    message: Message
+):
+    ensure_user(message)
 
     user = get_user(
-        callback.from_user.id
+        message.from_user.id
     )
 
-    if user:
+    if user and user["is_banned"]:
+        await message.answer(
+            "🚫 Ваш аккаунт заблокирован."
+        )
+        return
 
-        await callback.message.edit_text(
-            "🏠 <b>Главное меню Zolog AI</b>\n\n"
-            f"⭐ Ваш баланс: "
-            f"<b>{user['generations']}</b> генераций",
-            reply_markup=main_menu(),
-            parse_mode="HTML"
+    if message.text and message.text.startswith("/"):
+        return
+
+    if message.document:
+        await message.answer(
+            "📚 Чтобы добавить книгу для генерации, "
+            "нажмите «📝 Создать материал»."
         )
 
-    else:
-
-        await callback.message.edit_text(
-            "🏠 Главное меню",
+    elif message.text:
+        await message.answer(
+            "Выберите действие в меню:",
             reply_markup=main_menu()
         )
 
 
 # ============================================================
-# HEALTH SERVER FOR RENDER
+# HTTP SERVER
 # ============================================================
 
 async def health(request):
@@ -2821,7 +4782,6 @@ async def root(request):
 
 
 async def start_web_server():
-
     app = web.Application()
 
     app.router.add_get(
@@ -2847,7 +4807,8 @@ async def start_web_server():
     await site.start()
 
     logger.info(
-        f"🌐 Web server started on port {PORT}"
+        "HTTP server started on port %s",
+        PORT
     )
 
 
@@ -2856,60 +4817,34 @@ async def start_web_server():
 # ============================================================
 
 async def main():
+    init_db()
+
+    if not BOT_TOKEN:
+        raise RuntimeError(
+            "BOT_TOKEN не задан."
+        )
 
     logger.info(
-        "======================================"
+        "Starting Zolog AI..."
     )
 
-    logger.info(
-        "🚀 Zolog AI запускается..."
-    )
-
-    logger.info(
-        f"🤖 Main model: {GEMINI_MODEL}"
-    )
-
-    logger.info(
-        f"🔄 Fallback model: {GEMINI_FALLBACK_MODEL}"
-    )
-
-    logger.info(
-        "🔁 Retry system: ENABLED"
-    )
-
-    logger.info(
-        "======================================"
-    )
-
-    # Если раньше был webhook,
-    # удаляем его перед polling.
     await bot.delete_webhook(
         drop_pending_updates=True
     )
 
     await start_web_server()
 
-    try:
+    logger.info(
+        "Bot polling started."
+    )
 
-        await dp.start_polling(
-            bot
-        )
-
-    finally:
-
-        await bot.session.close()
+    await dp.start_polling(
+        bot
+    )
 
 
 if __name__ == "__main__":
-
     try:
-
-        asyncio.run(
-            main()
-        )
-
+        asyncio.run(main())
     except KeyboardInterrupt:
-
-        logger.info(
-            "Zolog AI остановлен."
-        )
+        pass
